@@ -1,3 +1,5 @@
+# backend/services/geocoding.py
+
 import time
 
 import requests
@@ -7,6 +9,11 @@ NOMINATIM_URL = (
     "https://nominatim.openstreetmap.org/search"
 )
 
+HEADERS = {
+    "User-Agent":
+        "Farmora/1.0 agriculture project"
+}
+
 
 def geocode_market(
     market,
@@ -15,29 +22,32 @@ def geocode_market(
 ):
 
     queries = [
-        f"{market}, {district}, {state}, India",
-        f"{market}, {district}, India",
-        f"{district}, {state}, India",
-    ]
 
-    headers = {
-        "User-Agent": "Farmora/1.0 agriculture project"
-    }
+        f"{market}, {district}, {state}, India",
+
+        f"{market}, {district}, India",
+
+        f"{district}, {state}, India"
+    ]
 
     for query in queries:
 
         try:
 
             response = requests.get(
+
                 NOMINATIM_URL,
+
                 params={
                     "q": query,
                     "format": "json",
                     "limit": 1,
-                    "countrycodes": "in",
+                    "countrycodes": "in"
                 },
-                headers=headers,
-                timeout=15,
+
+                headers=HEADERS,
+
+                timeout=15
             )
 
             response.raise_for_status()
@@ -48,18 +58,28 @@ def geocode_market(
 
                 result = results[0]
 
+                lat = float(
+                    result["lat"]
+                )
+
+                lon = float(
+                    result["lon"]
+                )
+
                 time.sleep(1)
 
                 return {
-                    "lat": float(
-                        result["lat"]
-                    ),
-                    "lon": float(
-                        result["lon"]
-                    )
+                    "market": market,
+                    "lat": lat,
+                    "lon": lon
                 }
 
-        except Exception:
+        except Exception as exc:
+
+            print(
+                f"Geocoding failed for "
+                f"{market}: {exc}"
+            )
 
             continue
 
@@ -67,16 +87,23 @@ def geocode_market(
 
 
 def get_market_locations(
-    df,
+    state,
     district,
-    state
+    crop
 ):
 
-    locations = []
+    from backend.services.agmarknet import (
+        get_price_history
+    )
+
+    df = get_price_history(
+        state=state,
+        district=district,
+        crop=crop
+    )
 
     if df.empty:
-
-        return locations
+        return []
 
     markets = (
         df["market"]
@@ -84,22 +111,23 @@ def get_market_locations(
         .astype(str)
         .str.strip()
         .unique()
+        .tolist()
     )
+
+    locations = []
 
     for market in markets:
 
-        coordinates = geocode_market(
-            market,
-            district,
-            state
+        location = geocode_market(
+            market=market,
+            district=district,
+            state=state
         )
 
-        if coordinates:
+        if location:
 
-            locations.append({
-                "market": market,
-                "lat": coordinates["lat"],
-                "lon": coordinates["lon"]
-            })
+            locations.append(
+                location
+            )
 
     return locations
