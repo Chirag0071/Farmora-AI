@@ -24,6 +24,6 @@ with col2:
     if st.button(
         "Predict Now",
         type="primary",
-        use_container_width=True
+        width="stretch"
     ):
         st.switch_page("pages/predict.py")
