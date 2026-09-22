@@ -26,7 +26,7 @@ CITIES_API = (
 
 
 # ============================================================
-# Header — ORIGINAL DESIGN
+# HEADER
 # ============================================================
 
 st.markdown(
@@ -43,17 +43,22 @@ st.markdown(
 
 
 # ============================================================
-# Location Helpers
+# LOCATION HELPERS
 # ============================================================
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(
+    show_spinner=False,
+    ttl=86400
+)
 def get_india_states():
 
     try:
 
         response = requests.post(
             STATES_API,
-            json={"country": "India"},
+            json={
+                "country": "India"
+            },
             timeout=10
         )
 
@@ -63,27 +68,44 @@ def get_india_states():
 
         states = [
             item["name"]
-            for item in data.get("data", {}).get("states", [])
+            for item in
+            data.get(
+                "data",
+                {}
+            ).get(
+                "states",
+                []
+            )
         ]
 
-        return sorted(states)
+        return sorted(
+            states
+        )
 
     except Exception:
 
         return []
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
-def get_state_districts(state_name):
+@st.cache_data(
+    show_spinner=False,
+    ttl=86400
+)
+def get_state_districts(
+    state_name
+):
 
     try:
 
         response = requests.post(
+
             CITIES_API,
+
             json={
                 "country": "India",
                 "state": state_name
             },
+
             timeout=10
         )
 
@@ -91,7 +113,12 @@ def get_state_districts(state_name):
 
         data = response.json()
 
-        return sorted(data.get("data", []))
+        return sorted(
+            data.get(
+                "data",
+                []
+            )
+        )
 
     except Exception:
 
@@ -99,7 +126,7 @@ def get_state_districts(state_name):
 
 
 # ============================================================
-# Load States
+# STATES
 # ============================================================
 
 india_states = get_india_states()
@@ -109,12 +136,12 @@ if not india_states:
 
     st.error(
         "Couldn't load the list of states right now. "
-        "Please check your internet connection and try again."
+        "Please check your internet connection."
     )
 
 
 # ============================================================
-# Selection Inputs — SAME LAYOUT
+# INPUTS
 # ============================================================
 
 col1, col2 = st.columns(2)
@@ -124,42 +151,41 @@ with col1:
 
     state = st.selectbox(
         "Select State",
-        ["Select State"] + india_states
+        ["Select State"] +
+        india_states
     )
-
 
     if state != "Select State":
 
-        districts = get_state_districts(state)
+        districts = get_state_districts(
+            state
+        )
 
     else:
 
         districts = []
 
-
-    if state != "Select State" and districts:
+    if (
+        state != "Select State"
+        and districts
+    ):
 
         district = st.selectbox(
             "Select District",
-            ["Select District"] + districts
+            ["Select District"] +
+            districts
         )
 
     else:
 
         district = st.text_input(
-            "Enter District",
-            help=(
-                "District list unavailable for this state — "
-                "type it manually."
-                if state != "Select State"
-                else None
-            )
+            "Enter District"
         )
-
 
     crop = st.selectbox(
         "Select Crop",
-        ["Select Crop"] + INDIA_CROPS
+        ["Select Crop"] +
+        INDIA_CROPS
     )
 
 
@@ -172,36 +198,75 @@ with col2:
         step=100.0
     )
 
+    arrival_date = st.date_input(
+        "Historical Arrival Date (Optional)",
+        value=None
+    )
+
 
 # ============================================================
-# Submit
+# SUBMIT
 # ============================================================
 
 if st.button(
     "Show Details",
     type="primary",
-    use_container_width=True
+    width="stretch"
 ):
 
     if state == "Select State":
 
-        st.warning("Please select a state.")
+        st.warning(
+            "Please select a state."
+        )
 
-    elif not district or district == "Select District":
+    elif (
+        not district
+        or district == "Select District"
+    ):
 
-        st.warning("Please enter a district.")
+        st.warning(
+            "Please enter a district."
+        )
 
     elif crop == "Select Crop":
 
-        st.warning("Please select a crop.")
+        st.warning(
+            "Please select a crop."
+        )
 
     else:
 
-        st.session_state["prediction"] = {
-            "state": state,
-            "district": district,
-            "crop": crop,
-            "production_cost": production_cost
+        selected_date = None
+
+        if arrival_date:
+
+            selected_date = (
+                arrival_date.strftime(
+                    "%d-%m-%Y"
+                )
+            )
+
+        st.session_state[
+            "prediction"
+        ] = {
+
+            "state":
+                state,
+
+            "district":
+                district,
+
+            "crop":
+                crop,
+
+            "production_cost":
+                production_cost,
+
+            "arrival_date":
+                selected_date
         }
 
-        st.switch_page("pages/result.py")
+        st.switch_page(
+            "pages/result.py"
+        )
