@@ -1,36 +1,57 @@
 # backend/services/agmarknet.py
 
 import os
-import requests
+from functools import lru_cache
+
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
+
 load_dotenv()
+
 
 API_KEY = os.getenv("AGMARKNET_API_KEY")
 
 RESOURCE_ID = "35985678-0d79-46b4-9ed6-6f13308a1d24"
 
-API_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
+API_URL = (
+    f"https://api.data.gov.in/resource/{RESOURCE_ID}"
+)
 
 HEADERS = {
     "User-Agent": "Farmora/1.0"
 }
+
+# Keep this reasonably high, but don't let one request hang forever.
+REQUEST_TIMEOUT = 60
+
+# Number of API pages to fetch.
+# The API was returning 10 records previously, so 10 pages
+# gives us up to roughly 100 records without hammering the API.
+MAX_PAGES = 10
+
+PAGE_SIZE = 10
 
 
 class AGMARKNETError(Exception):
     pass
 
 
-def fetch_agmarknet(
+# ============================================================
+# API REQUEST
+# ============================================================
+
+def _request_page(
     state: str,
     district: str,
     commodity: str | None = None,
-    limit: int = 1000,
+    limit: int = PAGE_SIZE,
     offset: int = 0
 ):
 
     if not API_KEY:
+
         raise AGMARKNETError(
             "AGMARKNET_API_KEY is missing from .env"
         )
@@ -40,15 +61,15 @@ def fetch_agmarknet(
         "format": "json",
         "limit": limit,
         "offset": offset,
-
-        # IMPORTANT:
-        # Current resource uses capitalized field names.
         "filters[State]": state,
         "filters[District]": district,
     }
 
     if commodity:
-        params["filters[Commodity]"] = commodity
+
+        params[
+            "filters[Commodity]"
+        ] = commodity
 
     try:
 
@@ -56,10 +77,18 @@ def fetch_agmarknet(
             API_URL,
             params=params,
             headers=HEADERS,
-            timeout=30
+            timeout=REQUEST_TIMEOUT
         )
 
-    except requests.RequestException as exc:
+    except requests.exceptions.Timeout:
+
+        raise AGMARKNETError(
+            "AGMARKNET request timed out. "
+            "The government API is responding slowly. "
+            "Please try again."
+        )
+
+    except requests.exceptions.RequestException as exc:
 
         raise AGMARKNETError(
             f"Unable to connect to AGMARKNET: {exc}"
@@ -89,34 +118,133 @@ def fetch_agmarknet(
             f"AGMARKNET API error: {data}"
         )
 
-    records = data.get("records", [])
+    records = data.get(
+        "records",
+        []
+    )
 
     if not isinstance(records, list):
 
         raise AGMARKNETError(
-            "Invalid 'records' returned by AGMARKNET."
+            "Invalid records returned by AGMARKNET."
         )
 
-    return records
+    return data
 
 
-def records_to_dataframe(records):
+# ============================================================
+# FETCH RECORDS
+# ============================================================
+
+@lru_cache(maxsize=32)
+def fetch_agmarknet(
+    state: str,
+    district: str,
+    commodity: str | None = None
+):
+
+    all_records = []
+
+    offset = 0
+
+    for page_number in range(
+        MAX_PAGES
+    ):
+
+        print(
+            f"AGMARKNET request "
+            f"page {page_number + 1}/"
+            f"{MAX_PAGES}, "
+            f"offset={offset}"
+        )
+
+        data = _request_page(
+            state=state,
+            district=district,
+            commodity=commodity,
+            limit=PAGE_SIZE,
+            offset=offset
+        )
+
+        records = data.get(
+            "records",
+            []
+        )
+
+        if not records:
+            break
+
+        all_records.extend(
+            records
+        )
+
+        offset += len(records)
+
+        # If API gives fewer records than requested,
+        # there is normally no next page.
+        if len(records) < PAGE_SIZE:
+            break
+
+    # --------------------------------------------------------
+    # Remove duplicates
+    # --------------------------------------------------------
+
+    unique_records = []
+
+    seen = set()
+
+    for record in all_records:
+
+        key = (
+            record.get("Arrival_Date"),
+            record.get("Commodity"),
+            record.get("Market"),
+            record.get("Variety"),
+            record.get("Grade"),
+            record.get("Modal_Price")
+        )
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique_records.append(
+                record
+            )
+
+    print(
+        "Total unique AGMARKNET records:",
+        len(unique_records)
+    )
+
+    return unique_records
+
+
+# ============================================================
+# DATAFRAME
+# ============================================================
+
+def records_to_dataframe(
+    records
+):
+
+    columns = [
+        "state",
+        "district",
+        "market",
+        "commodity",
+        "variety",
+        "grade",
+        "arrival_date",
+        "min_price",
+        "modal_price",
+        "max_price",
+    ]
 
     if not records:
 
         return pd.DataFrame(
-            columns=[
-                "state",
-                "district",
-                "market",
-                "commodity",
-                "variety",
-                "grade",
-                "arrival_date",
-                "min_price",
-                "modal_price",
-                "max_price",
-            ]
+            columns=columns
         )
 
     rows = []
@@ -125,57 +253,93 @@ def records_to_dataframe(records):
 
         rows.append({
 
-            "state": str(
-                record.get("State", "")
-            ).strip(),
+            "state":
+                str(
+                    record.get(
+                        "State",
+                        ""
+                    )
+                ).strip(),
 
-            "district": str(
-                record.get("District", "")
-            ).strip(),
+            "district":
+                str(
+                    record.get(
+                        "District",
+                        ""
+                    )
+                ).strip(),
 
-            "market": str(
-                record.get("Market", "")
-            ).strip(),
+            "market":
+                str(
+                    record.get(
+                        "Market",
+                        ""
+                    )
+                ).strip(),
 
-            "commodity": str(
-                record.get("Commodity", "")
-            ).strip(),
+            "commodity":
+                str(
+                    record.get(
+                        "Commodity",
+                        ""
+                    )
+                ).strip(),
 
-            "variety": str(
-                record.get("Variety", "")
-            ).strip(),
+            "variety":
+                str(
+                    record.get(
+                        "Variety",
+                        ""
+                    )
+                ).strip(),
 
-            "grade": str(
-                record.get("Grade", "")
-            ).strip(),
+            "grade":
+                str(
+                    record.get(
+                        "Grade",
+                        ""
+                    )
+                ).strip(),
 
-            "arrival_date": record.get(
-                "Arrival_Date"
-            ),
+            "arrival_date":
+                record.get(
+                    "Arrival_Date"
+                ),
 
-            "min_price": record.get(
-                "Min_Price"
-            ),
+            "min_price":
+                record.get(
+                    "Min_Price"
+                ),
 
-            "modal_price": record.get(
-                "Modal_Price"
-            ),
+            "modal_price":
+                record.get(
+                    "Modal_Price"
+                ),
 
-            "max_price": record.get(
-                "Max_Price"
-            ),
+            "max_price":
+                record.get(
+                    "Max_Price"
+                )
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        rows
+    )
 
-    # Dates
+    # --------------------------------------------------------
+    # Date
+    # --------------------------------------------------------
+
     df["arrival_date"] = pd.to_datetime(
         df["arrival_date"],
-        format="%d/%m/%Y",
+        dayfirst=True,
         errors="coerce"
     )
 
+    # --------------------------------------------------------
     # Prices
+    # --------------------------------------------------------
+
     for column in [
         "min_price",
         "modal_price",
@@ -187,7 +351,10 @@ def records_to_dataframe(records):
             errors="coerce"
         )
 
-    # Remove invalid price/date rows
+    # --------------------------------------------------------
+    # Remove invalid rows
+    # --------------------------------------------------------
+
     df = df.dropna(
         subset=[
             "arrival_date",
@@ -195,8 +362,23 @@ def records_to_dataframe(records):
         ]
     )
 
+    df = (
+        df
+        .sort_values(
+            "arrival_date"
+        )
+        .drop_duplicates()
+        .reset_index(
+            drop=True
+        )
+    )
+
     return df
 
+
+# ============================================================
+# PRICE HISTORY
+# ============================================================
 
 def get_price_history(
     state: str,
@@ -205,13 +387,14 @@ def get_price_history(
 ):
 
     records = fetch_agmarknet(
-        state=state,
-        district=district,
-        commodity=crop,
-        limit=1000
+        state,
+        district,
+        crop
     )
 
-    df = records_to_dataframe(records)
+    df = records_to_dataframe(
+        records
+    )
 
     if df.empty:
 
@@ -223,40 +406,100 @@ def get_price_history(
     return df
 
 
-def get_latest_record(df):
+# ============================================================
+# EXACT DATE
+# ============================================================
 
-    if df.empty:
-        return None
+def get_price_by_date(
+    state: str,
+    district: str,
+    crop: str,
+    arrival_date: str
+):
 
-    df = df.sort_values(
-        "arrival_date",
-        ascending=False
+    df = get_price_history(
+        state,
+        district,
+        crop
     )
 
-    row = df.iloc[0]
+    try:
+
+        target_date = pd.to_datetime(
+            arrival_date,
+            dayfirst=True,
+            errors="raise"
+        ).normalize()
+
+    except Exception:
+
+        raise AGMARKNETError(
+            "Invalid arrival date. "
+            "Please use DD-MM-YYYY."
+        )
+
+    return df[
+        df["arrival_date"].dt.normalize()
+        == target_date
+    ].copy()
+
+
+# ============================================================
+# LATEST
+# ============================================================
+
+def get_latest_record(
+    df
+):
+
+    if df.empty:
+
+        return None
+
+    temp = (
+        df
+        .sort_values(
+            "arrival_date",
+            ascending=False
+        )
+    )
+
+    row = temp.iloc[0]
 
     return {
-        "date": row["arrival_date"].strftime(
-            "%Y-%m-%d"
-        ),
 
-        "market": row["market"],
+        "date":
+            row["arrival_date"].strftime(
+                "%Y-%m-%d"
+            ),
 
-        "min_price": float(
-            row["min_price"]
-        ),
+        "market":
+            row["market"],
 
-        "modal_price": float(
-            row["modal_price"]
-        ),
+        "min_price":
+            float(
+                row["min_price"]
+            ),
 
-        "max_price": float(
-            row["max_price"]
-        )
+        "modal_price":
+            float(
+                row["modal_price"]
+            ),
+
+        "max_price":
+            float(
+                row["max_price"]
+            )
     }
 
 
-def get_monthly_history(df):
+# ============================================================
+# MONTHLY
+# ============================================================
+
+def get_monthly_history(
+    df
+):
 
     if df.empty:
 
@@ -278,7 +521,9 @@ def get_monthly_history(df):
 
     monthly = (
         temp
-        .set_index("arrival_date")
+        .set_index(
+            "arrival_date"
+        )
         ["modal_price"]
         .resample("MS")
         .mean()
@@ -288,7 +533,8 @@ def get_monthly_history(df):
 
     monthly.rename(
         columns={
-            "arrival_date": "date"
+            "arrival_date":
+                "date"
         },
         inplace=True
     )
