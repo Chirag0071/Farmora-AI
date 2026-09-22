@@ -1,61 +1,67 @@
-from typing import List
+# backend/services/recommendations.py
 
 import pandas as pd
+
+from backend.services.agmarknet import (
+    fetch_agmarknet,
+    records_to_dataframe,
+    AGMARKNETError
+)
 
 
 def _score_crop(df):
 
     if df.empty:
-
         return None
 
-    df = df.copy()
+    data = df.copy()
 
-    df["arrival_date"] = pd.to_datetime(
-        df["arrival_date"],
+    data["arrival_date"] = pd.to_datetime(
+        data["arrival_date"],
         errors="coerce"
     )
 
-    df["modal_price"] = pd.to_numeric(
-        df["modal_price"],
+    data["modal_price"] = pd.to_numeric(
+        data["modal_price"],
         errors="coerce"
     )
 
-    df = df.dropna(
+    data = data.dropna(
         subset=[
             "arrival_date",
             "modal_price"
         ]
     )
 
-    if df.empty:
-
+    if data.empty:
         return None
 
-    recent_date = df["arrival_date"].max()
+    latest_date = (
+        data["arrival_date"].max()
+    )
 
-    recent = df[
-        df["arrival_date"]
-        >= recent_date - pd.Timedelta(days=365)
+    recent = data[
+        data["arrival_date"]
+        >= latest_date -
+        pd.Timedelta(days=365)
     ]
 
     if recent.empty:
+        recent = data
 
-        recent = df
-
-    average_price = (
-        recent["modal_price"]
-        .mean()
+    average_price = float(
+        recent["modal_price"].mean()
     )
 
-    observations = len(recent)
-
-    market_count = (
-        recent["market"]
-        .nunique()
+    observations = len(
+        recent
     )
 
-    recent_months = (
+    market_count = int(
+        recent["market"].nunique()
+    )
+
+    monthly = (
         recent
         .set_index("arrival_date")
         ["modal_price"]
@@ -64,75 +70,119 @@ def _score_crop(df):
         .dropna()
     )
 
-    if len(recent_months) >= 3:
+    trend = 0.0
 
-        first = recent_months.iloc[
-            :max(1, len(recent_months) // 2)
-        ].mean()
+    if len(monthly) >= 3:
 
-        last = recent_months.iloc[
-            len(recent_months) // 2:
-        ].mean()
-
-        trend = (
-            ((last - first) / first) * 100
-            if first
-            else 0
+        middle = max(
+            1,
+            len(monthly) // 2
         )
 
-    else:
+        first = float(
+            monthly.iloc[:middle].mean()
+        )
 
-        trend = 0
+        last = float(
+            monthly.iloc[middle:].mean()
+        )
 
-    # Normalised practical demand score.
+        if first > 0:
+
+            trend = (
+                (last - first)
+                / first
+            ) * 100
+
+    # --------------------------------------------------------
+    # Market-activity score
+    # --------------------------------------------------------
+
     score = (
-        min(observations, 365) * 0.30
-        + min(market_count, 20) * 5 * 0.25
-        + min(average_price / 100, 100) * 0.25
-        + max(min(trend, 30), -30) * 0.20
+
+        min(
+            observations,
+            365
+        ) * 0.30
+
+        +
+
+        min(
+            market_count,
+            20
+        ) * 5 * 0.25
+
+        +
+
+        min(
+            average_price / 100,
+            100
+        ) * 0.25
+
+        +
+
+        max(
+            min(trend, 30),
+            -30
+        ) * 0.20
     )
 
     return {
-        "average_price": round(
-            float(average_price),
-            2
-        ),
-        "market_count": int(
-            market_count
-        ),
-        "observations": int(
-            observations
-        ),
-        "trend_percent": round(
-            float(trend),
-            2
-        ),
-        "score": round(
-            float(score),
-            2
-        )
+
+        "average_price":
+            round(
+                average_price,
+                2
+            ),
+
+        "market_count":
+            market_count,
+
+        "observations":
+            observations,
+
+        "trend_percent":
+            round(
+                trend,
+                2
+            ),
+
+        "score":
+            round(
+                score,
+                2
+            )
     }
 
 
-def recommend_crops(
+def get_crop_suggestions(
     state,
     district,
-    selected_crop,
-    base_dataframe,
+    selected_crop=None,
     max_results=8
 ):
 
-    if base_dataframe.empty:
+    records = fetch_agmarknet(
+        state=state,
+        district=district,
+        commodity=None
+    )
 
-        return []
+    df = records_to_dataframe(
+        records
+    )
 
-    # Use commodities available in the selected
-    # district/state data.
+    if df.empty:
+
+        raise AGMARKNETError(
+            f"No market data found for "
+            f"{district}, {state}."
+        )
+
     candidates = []
 
     for commodity, group in (
-        base_dataframe
-        .groupby("commodity")
+        df.groupby("commodity")
     ):
 
         commodity = str(
@@ -140,7 +190,13 @@ def recommend_crops(
         ).strip()
 
         if not commodity:
+            continue
 
+        if (
+            selected_crop
+            and commodity.lower()
+            == selected_crop.lower()
+        ):
             continue
 
         stats = _score_crop(
@@ -148,16 +204,16 @@ def recommend_crops(
         )
 
         if not stats:
-
             continue
 
         candidates.append({
+
             "crop": commodity,
+
             **stats
         })
 
     if not candidates:
-
         return []
 
     result = pd.DataFrame(
