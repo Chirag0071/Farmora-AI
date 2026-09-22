@@ -1,3 +1,5 @@
+# backend/services/forecasting.py
+
 import numpy as np
 import pandas as pd
 
@@ -20,12 +22,29 @@ FEATURES = [
 ]
 
 
+# ============================================================
+# CREATE FEATURES
+# ============================================================
+
 def create_features(df):
 
     data = df.copy()
 
     data["date"] = pd.to_datetime(
-        data["date"]
+        data["date"],
+        errors="coerce"
+    )
+
+    data["modal_price"] = pd.to_numeric(
+        data["modal_price"],
+        errors="coerce"
+    )
+
+    data = data.dropna(
+        subset=[
+            "date",
+            "modal_price"
+        ]
     )
 
     data = (
@@ -35,23 +54,43 @@ def create_features(df):
         .reset_index(drop=True)
     )
 
-    data["year"] = data["date"].dt.year
+    data["year"] = (
+        data["date"].dt.year
+    )
 
-    data["month"] = data["date"].dt.month
+    data["month"] = (
+        data["date"].dt.month
+    )
 
     data["month_sin"] = np.sin(
-        2 * np.pi * data["month"] / 12
+        2 * np.pi *
+        data["month"] / 12
     )
 
     data["month_cos"] = np.cos(
-        2 * np.pi * data["month"] / 12
+        2 * np.pi *
+        data["month"] / 12
     )
 
-    data["lag_1"] = data["modal_price"].shift(1)
-    data["lag_2"] = data["modal_price"].shift(2)
-    data["lag_3"] = data["modal_price"].shift(3)
-    data["lag_6"] = data["modal_price"].shift(6)
-    data["lag_12"] = data["modal_price"].shift(12)
+    data["lag_1"] = (
+        data["modal_price"].shift(1)
+    )
+
+    data["lag_2"] = (
+        data["modal_price"].shift(2)
+    )
+
+    data["lag_3"] = (
+        data["modal_price"].shift(3)
+    )
+
+    data["lag_6"] = (
+        data["modal_price"].shift(6)
+    )
+
+    data["lag_12"] = (
+        data["modal_price"].shift(12)
+    )
 
     data["rolling_3"] = (
         data["modal_price"]
@@ -77,16 +116,32 @@ def create_features(df):
     return data
 
 
-def _linear_forecast(history, periods):
+# ============================================================
+# LINEAR FALLBACK
+# ============================================================
+
+def linear_forecast(
+    history,
+    periods
+):
 
     history = history.copy()
 
     history["date"] = pd.to_datetime(
-        history["date"]
+        history["date"],
+        errors="coerce"
+    )
+
+    history["modal_price"] = pd.to_numeric(
+        history["modal_price"],
+        errors="coerce"
     )
 
     history = history.dropna(
-        subset=["modal_price"]
+        subset=[
+            "date",
+            "modal_price"
+        ]
     )
 
     if history.empty:
@@ -98,29 +153,45 @@ def _linear_forecast(history, periods):
             ]
         )
 
+    history = history.sort_values(
+        "date"
+    )
+
+    last_date = (
+        history["date"].iloc[-1]
+    )
+
+    future_dates = pd.date_range(
+        last_date +
+        pd.offsets.MonthBegin(1),
+        periods=periods,
+        freq="MS"
+    )
+
+    # One data point
     if len(history) == 1:
 
         value = float(
-            history["modal_price"].iloc[-1]
-        )
-
-        future_dates = pd.date_range(
-            history["date"].iloc[-1]
-            + pd.offsets.MonthBegin(1),
-            periods=periods,
-            freq="MS"
+            history[
+                "modal_price"
+            ].iloc[-1]
         )
 
         return pd.DataFrame({
+
             "date": future_dates,
-            "modal_price": [value] * periods
+
+            "modal_price":
+                [value] * periods
         })
 
     x = np.arange(
         len(history)
     )
 
-    y = history["modal_price"].values
+    y = history[
+        "modal_price"
+    ].values
 
     slope, intercept = np.polyfit(
         x,
@@ -143,37 +214,47 @@ def _linear_forecast(history, periods):
         0
     )
 
-    future_dates = pd.date_range(
-        history["date"].iloc[-1]
-        + pd.offsets.MonthBegin(1),
-        periods=periods,
-        freq="MS"
-    )
-
     return pd.DataFrame({
+
         "date": future_dates,
-        "modal_price": predictions
+
+        "modal_price":
+            predictions
     })
 
+
+# ============================================================
+# RANDOM FOREST FORECAST
+# ============================================================
 
 def forecast_prices(
     monthly_history,
     periods=12
 ):
 
-    if monthly_history.empty:
+    if monthly_history is None:
+        return pd.DataFrame()
 
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "modal_price"
-            ]
-        )
+    if monthly_history.empty:
+        return pd.DataFrame()
 
     history = monthly_history.copy()
 
     history["date"] = pd.to_datetime(
-        history["date"]
+        history["date"],
+        errors="coerce"
+    )
+
+    history["modal_price"] = pd.to_numeric(
+        history["modal_price"],
+        errors="coerce"
+    )
+
+    history = history.dropna(
+        subset=[
+            "date",
+            "modal_price"
+        ]
     )
 
     history = (
@@ -183,10 +264,16 @@ def forecast_prices(
         .reset_index(drop=True)
     )
 
-    # Not enough data for all lag features.
+    if history.empty:
+        return pd.DataFrame()
+
+    # --------------------------------------------------------
+    # Not enough data for RF
+    # --------------------------------------------------------
+
     if len(history) < 18:
 
-        return _linear_forecast(
+        return linear_forecast(
             history,
             periods
         )
@@ -196,21 +283,32 @@ def forecast_prices(
     )
 
     train = feature_data.dropna(
-        subset=FEATURES + ["modal_price"]
+        subset=FEATURES + [
+            "modal_price"
+        ]
     )
 
     if len(train) < 12:
 
-        return _linear_forecast(
+        return linear_forecast(
             history,
             periods
         )
 
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
     model = RandomForestRegressor(
+
         n_estimators=400,
+
         max_depth=12,
+
         min_samples_leaf=2,
+
         random_state=42,
+
         n_jobs=-1
     )
 
@@ -219,7 +317,13 @@ def forecast_prices(
         train["modal_price"]
     )
 
-    working = history.copy()
+    # --------------------------------------------------------
+    # Recursive forecasting
+    # --------------------------------------------------------
+
+    working = history[
+        ["date", "modal_price"]
+    ].copy()
 
     predictions = []
 
@@ -230,30 +334,17 @@ def forecast_prices(
             + pd.offsets.MonthBegin(1)
         )
 
-        values = working[
+        temp = working.copy()
+
+        temp.loc[
+            len(temp),
+            "date"
+        ] = next_date
+
+        temp.loc[
+            len(temp) - 1,
             "modal_price"
-        ].tolist()
-
-        if len(values) >= 12:
-
-            lag_12 = values[-12]
-
-        else:
-
-            lag_12 = values[0]
-
-        row = {
-            "date": next_date,
-            "modal_price": np.nan
-        }
-
-        temp = pd.concat(
-            [
-                working,
-                pd.DataFrame([row])
-            ],
-            ignore_index=True
-        )
+        ] = np.nan
 
         temp["year"] = (
             temp["date"].dt.year
@@ -264,11 +355,13 @@ def forecast_prices(
         )
 
         temp["month_sin"] = np.sin(
-            2 * np.pi * temp["month"] / 12
+            2 * np.pi *
+            temp["month"] / 12
         )
 
         temp["month_cos"] = np.cos(
-            2 * np.pi * temp["month"] / 12
+            2 * np.pi *
+            temp["month"] / 12
         )
 
         temp["lag_1"] = (
@@ -319,16 +412,17 @@ def forecast_prices(
 
         latest = temp.iloc[-1]
 
-        X = pd.DataFrame(
-            [{
-                feature: latest[feature]
+        X = pd.DataFrame([
+            {
+                feature:
+                    latest[feature]
                 for feature in FEATURES
-            }]
-        )
+            }
+        ])
 
         if X.isna().any().any():
 
-            return _linear_forecast(
+            return linear_forecast(
                 history,
                 periods
             )
@@ -338,24 +432,27 @@ def forecast_prices(
         )
 
         prediction = max(
-            0,
-            prediction
+            prediction,
+            0
         )
 
         predictions.append({
+
             "date": next_date,
+
             "modal_price": prediction
         })
 
         working = pd.concat(
             [
                 working,
-                pd.DataFrame(
-                    [{
+                pd.DataFrame([
+                    {
                         "date": next_date,
-                        "modal_price": prediction
-                    }]
-                )
+                        "modal_price":
+                            prediction
+                    }
+                ])
             ],
             ignore_index=True
         )
