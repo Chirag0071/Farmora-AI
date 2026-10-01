@@ -268,6 +268,34 @@ def forecast_prices(
         return pd.DataFrame()
 
     # --------------------------------------------------------
+    # Fill missing months
+    # --------------------------------------------------------
+    # lag_N / rolling_N use row shifts, so a skipped month would
+    # make lag_12 point at the wrong month. Build a continuous
+    # monthly series and interpolate the gaps.
+
+    history["date"] = (
+        history["date"]
+        .dt.to_period("M")
+        .dt.to_timestamp()
+    )
+
+    history = (
+        history
+        .groupby("date", as_index=False)["modal_price"]
+        .mean()
+        .set_index("date")
+        .asfreq("MS")
+    )
+
+    history["modal_price"] = (
+        history["modal_price"]
+        .interpolate(method="linear")
+    )
+
+    history = history.reset_index()
+
+    # --------------------------------------------------------
     # Not enough data for RF
     # --------------------------------------------------------
 
