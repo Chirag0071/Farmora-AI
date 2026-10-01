@@ -10,7 +10,7 @@ load_dotenv()
 API_BASE = os.getenv(
     "FARMORA_API_BASE",
     "http://127.0.0.1:8000",
-)
+).rstrip("/")
 
 
 def app():
@@ -82,7 +82,11 @@ def app():
 
             response.raise_for_status()
 
-            suggestions = response.json()
+            # API returns {"status": ..., "suggestions": [...]}
+            suggestions = response.json().get(
+                "suggestions",
+                [],
+            )
 
     except requests.exceptions.RequestException as exc:
 
