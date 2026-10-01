@@ -201,6 +201,15 @@ result_page = st.Page(
 )
 
 
+# Hidden suggestions page
+suggestions_page = st.Page(
+    "pages/suggestions.py",
+    title="Suggestions",
+    icon=":material/eco:",
+    visibility="hidden"
+)
+
+
 # --------------------------------------------------
 # Navigation
 # --------------------------------------------------
@@ -210,7 +219,8 @@ pg = st.navigation([
     about_page,
     help_page,
     predict_page,
-    result_page
+    result_page,
+    suggestions_page
 ])
 
 pg.run()
