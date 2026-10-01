@@ -71,28 +71,53 @@ def _request_page(
             "filters[Commodity]"
         ] = commodity
 
-    try:
+    response = None
 
-        response = requests.get(
-            API_URL,
-            params=params,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT
-        )
+    # First try normally; if the connection is refused (often a dead
+    # system/VPN proxy or firewall), retry once ignoring proxy settings.
+    for use_env in (True, False):
 
-    except requests.exceptions.Timeout:
+        session = requests.Session()
 
-        raise AGMARKNETError(
-            "AGMARKNET request timed out. "
-            "The government API is responding slowly. "
-            "Please try again."
-        )
+        session.trust_env = use_env
 
-    except requests.exceptions.RequestException as exc:
+        try:
 
-        raise AGMARKNETError(
-            f"Unable to connect to AGMARKNET: {exc}"
-        )
+            response = session.get(
+                API_URL,
+                params=params,
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            break
+
+        except requests.exceptions.Timeout:
+
+            raise AGMARKNETError(
+                "AGMARKNET request timed out. "
+                "The government API is responding slowly. "
+                "Please try again."
+            )
+
+        except requests.exceptions.RequestException as exc:
+
+            if not use_env:
+
+                # Never leak the API key in error messages.
+                message = str(exc).replace(
+                    API_KEY,
+                    "***"
+                )
+
+                raise AGMARKNETError(
+                    f"Unable to connect to AGMARKNET: "
+                    f"{message}"
+                )
+
+        finally:
+
+            session.close()
 
     if response.status_code != 200:
 
@@ -360,6 +385,17 @@ def records_to_dataframe(
             "arrival_date",
             "modal_price"
         ]
+    )
+
+    # Some AGMARKNET rows have blank/"NA" min or max prices.
+    # NaN can't be serialized to JSON (FastAPI returns a 500),
+    # so fall back to the modal price for those rows.
+    df["min_price"] = df["min_price"].fillna(
+        df["modal_price"]
+    )
+
+    df["max_price"] = df["max_price"].fillna(
+        df["modal_price"]
     )
 
     df = (
