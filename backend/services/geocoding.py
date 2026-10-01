@@ -66,8 +66,6 @@ def geocode_market(
                     result["lon"]
                 )
 
-                time.sleep(1)
-
                 return {
                     "market": market,
                     "lat": lat,
@@ -81,7 +79,12 @@ def geocode_market(
                 f"{market}: {exc}"
             )
 
-            continue
+        finally:
+
+            # Nominatim allows max 1 request/second.
+            # Throttle every request, not just successful ones,
+            # otherwise failed/empty lookups get the IP blocked.
+            time.sleep(1)
 
     return None
 
