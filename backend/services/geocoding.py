@@ -5,6 +5,8 @@ import time
 import requests
 
 
+MAX_MARKETS = 12
+
 NOMINATIM_URL = (
     "https://nominatim.openstreetmap.org/search"
 )
@@ -15,11 +17,18 @@ HEADERS = {
 }
 
 
+_GEO_CACHE = {}
+
+
 def geocode_market(
     market,
     district,
     state
 ):
+
+    cache_key = (market, district, state)
+    if cache_key in _GEO_CACHE:
+        return _GEO_CACHE[cache_key]
 
     queries = [
 
@@ -68,11 +77,16 @@ def geocode_market(
 
                 time.sleep(1)
 
-                return {
+                found = {
                     "market": market,
                     "lat": lat,
                     "lon": lon
                 }
+
+                # Only successful lookups are cached.
+                _GEO_CACHE[cache_key] = found
+
+                return found
 
         except Exception as exc:
 
@@ -116,7 +130,8 @@ def get_market_locations(
 
     locations = []
 
-    for market in markets:
+    # Nominatim allows ~1 request/second, so keep the list bounded.
+    for market in markets[:MAX_MARKETS]:
 
         location = geocode_market(
             market=market,
