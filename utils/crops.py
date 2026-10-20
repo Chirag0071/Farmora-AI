@@ -90,3 +90,55 @@ INDIA_CROPS = sorted([
     "Cashewnut",
     "Groundnut Pods",
 ])
+
+
+# AGMARKNET spells many commodities differently from the names shown in the UI.
+# These are tried (in order) when the selected name returns no data.
+CROP_ALIASES = {
+    "Rice": ["Rice", "Paddy(Dhan)(Common)"],
+    "Paddy(Dhan)(Common)": ["Paddy(Dhan)(Common)", "Rice"],
+    "Arhar(Tur/Red Gram)": ["Arhar (Tur/Red Gram)(Whole)", "Arhar Dal(Tur Dal)"],
+    "Gram(Chana)": ["Bengal Gram(Gram)(Whole)", "Gram Raw(Chholia)"],
+    "Moong(Green Gram)": ["Green Gram (Moong)(Whole)", "Moong Dal"],
+    "Urad(Black Gram)": ["Black Gram (Urad Beans)(Whole)", "Urad Dal"],
+    "Masur(Lentil)": ["Lentil (Masur)(Whole)", "Masur Dal"],
+    "Bajra(Pearl Millet)": ["Bajra(Pearl Millet/Cumbu)"],
+    "Ragi(Finger Millet)": ["Ragi (Finger Millet)"],
+    "Barley": ["Barley (Jau)"],
+    "Sesame(Til)": ["Sesamum(Sesame,Gingelly,Til)"],
+    "Niger Seed": ["Niger Seed (Ramtil)"],
+    "Okra(Bhindi)": ["Bhindi(Ladies Finger)"],
+    "Ridge Gourd": ["Ridgeguard(Tori)"],
+    "Bottle Gourd": ["Bottle gourd"],
+    "Bitter Gourd": ["Bitter gourd"],
+    "Cucumber": ["Cucumbar(Kheera)"],
+    "Capsicum": ["Capsicum", "Chilly Capsicum"],
+    "Chilli(Dry)": ["Dry Chillies"],
+    "Peas(Vegetable)": ["Green Peas", "Peas Wet"],
+    "Peas": ["Peas(Dry)", "Green Peas"],
+    "Colocasia(Arbi)": ["Colacasia"],
+    "Ginger": ["Ginger(Green)", "Ginger(Dry)"],
+    "Coriander": ["Coriander(Leaves)", "Coriander Seed"],
+    "Cumin(Jeera)": ["Cummin Seed(Jeera)", "Cumin Seed(Jeera)"],
+    "Fenugreek(Methi)": ["Methi(Leaves)", "Methi Seeds"],
+    "Sweet Lime(Mosambi)": ["Mousambi(Sweet Lime)"],
+    "Watermelon": ["Water Melon"],
+    "Jackfruit": ["Jack Fruit"],
+    "Cashewnut": ["Cashewnuts"],
+    "Arecanut": ["Arecanut(Betelnut/Supari)"],
+    "Cardamom": ["Cardamoms"],
+    "Black Pepper": ["Black pepper"],
+    "Sapota(Chikoo)": ["Sapota", "Chikoos(Sapota)"],
+    "Soyabean": ["Soyabean", "Soyabeans"],
+    "Tapioca": ["Tapioca", "Tapioca (Cassava)"],
+    "Groundnut Pods": ["Groundnut pods (raw)", "Groundnut"],
+}
+
+
+def commodity_candidates(crop):
+    """Return the selected crop name followed by known AGMARKNET aliases."""
+    names = [crop]
+    for alias in CROP_ALIASES.get(crop, []):
+        if alias not in names:
+            names.append(alias)
+    return names
