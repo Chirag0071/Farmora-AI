@@ -1,8 +1,8 @@
-streamlit>=1.40
+streamlit>=1.56,<2
 fastapi>=0.115
 uvicorn[standard]>=0.30
 requests>=2.32
 python-dotenv>=1.0
 pandas>=2.2
 numpy>=1.26
-scikit-learn>=1.5
+plotly>=5.24
