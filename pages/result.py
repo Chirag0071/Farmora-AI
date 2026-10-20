@@ -5,6 +5,8 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+from utils.charts import build_price_3d_chart, build_market_map
+
 
 load_dotenv()
 
@@ -74,8 +76,7 @@ st.markdown(
     <div class="glass-card">
         <h1>📊 Farmora Results</h1>
         <p>
-            Crop price analysis, future forecast,
-            market locations and crop suggestions.
+            Crop price analysis with historical observations and future forecasts.
         </p>
     </div>
     """,
@@ -204,20 +205,15 @@ if latest:
 
     m1, m2, m3 = st.columns(3)
 
-    m1.metric(
-        "Min Price (₹/qtl)",
-        f"{latest['min_price']:,.0f}"
-    )
+    def _fmt(value):
+        try:
+            return f"{float(value):,.0f}"
+        except (TypeError, ValueError):
+            return "N/A"
 
-    m2.metric(
-        "Modal Price (₹/qtl)",
-        f"{latest['modal_price']:,.0f}"
-    )
-
-    m3.metric(
-        "Max Price (₹/qtl)",
-        f"{latest['max_price']:,.0f}"
-    )
+    m1.metric("Min Price (₹/qtl)", _fmt(latest.get("min_price")))
+    m2.metric("Modal Price (₹/qtl)", _fmt(latest.get("modal_price")))
+    m3.metric("Max Price (₹/qtl)", _fmt(latest.get("max_price")))
 
     st.caption(
         f"Market: {latest['market']} • "
@@ -277,208 +273,98 @@ if arrival_date:
 
     else:
 
+        latest_date = latest["date"] if latest else None
         st.info(
-            "No AGMARKNET price record was found "
-            "for this crop on the selected arrival date."
+            "No mandi reported a price for this crop in this district on the selected date "
+            "(markets don't report every day, and today's prices appear only after the mandi "
+            "uploads them). "
+            + (f"The most recent available price is from {latest_date}." if latest_date else "")
         )
 
 
 # ============================================================
-# HISTORICAL PRICE GRAPH
+# PAST, PRESENT AND FUTURE PRICE LINE GRAPH
 # ============================================================
 
-st.write(
-    "### 📈 Historical Crop Prices"
-)
+st.write("### 📈 Past, Present & Future Price")
 
+history = pd.DataFrame(price_data.get("monthly_history", []))
+forecast = pd.DataFrame(price_data.get("forecast", []))
 
-history = pd.DataFrame(
-    price_data.get(
-        "monthly_history",
-        []
-    )
-)
+for frame in (history, forecast):
+    if not frame.empty:
+        frame["date"] = pd.to_datetime(frame.get("date"), errors="coerce")
+        frame["modal_price"] = pd.to_numeric(frame.get("modal_price"), errors="coerce")
+        frame.dropna(subset=["date", "modal_price"], inplace=True)
 
+present_point = None
+if latest and latest.get("date") and latest.get("modal_price") is not None:
+    present_date = pd.to_datetime(latest.get("date"), errors="coerce")
+    present_price = pd.to_numeric(latest.get("modal_price"), errors="coerce")
+    if pd.notna(present_date) and pd.notna(present_price):
+        present_point = {"date": present_date, "modal_price": float(present_price)}
 
-if not history.empty:
+chart = build_price_3d_chart(history, present_point, forecast)
 
-    history["date"] = pd.to_datetime(
-        history["date"],
-        errors="coerce"
-    )
-
-    history["modal_price"] = pd.to_numeric(
-        history["modal_price"],
-        errors="coerce"
-    )
-
-    history = history.dropna(
-        subset=[
-            "date",
-            "modal_price"
-        ]
-    )
-
-    history_chart = (
-        history
-        .set_index("date")
-        [["modal_price"]]
-        .rename(
-            columns={
-                "modal_price":
-                    "Modal Price (₹/qtl)"
-            }
-        )
-    )
-
-    st.line_chart(
-        history_chart,
-        width="stretch"
-    )
-
-else:
-
-    st.info(
-        "No historical monthly price data available."
-    )
-
-
-# ============================================================
-# FUTURE FORECAST
-# ============================================================
-
-st.write(
-    "### 🔮 Next 12-Month Price Forecast"
-)
-
-
-forecast = pd.DataFrame(
-    price_data.get(
-        "forecast",
-        []
-    )
-)
-
-
-if forecast.empty:
-
-    st.warning(
-        "Not enough historical data to generate "
-        "a future forecast."
-    )
-
-else:
-
-    forecast["date"] = pd.to_datetime(
-        forecast["date"],
-        errors="coerce"
-    )
-
-    forecast["modal_price"] = pd.to_numeric(
-        forecast["modal_price"],
-        errors="coerce"
-    )
-
-    forecast = forecast.dropna(
-        subset=[
-            "date",
-            "modal_price"
-        ]
-    )
-
-    forecast_chart = (
-        forecast
-        .set_index("date")
-        [["modal_price"]]
-        .rename(
-            columns={
-                "modal_price":
-                    "Predicted Price (₹/qtl)"
-            }
-        )
-    )
-
-    st.line_chart(
-        forecast_chart,
-        width="stretch"
-    )
-
+if chart is not None:
+    st.plotly_chart(chart, width="stretch")
     st.caption(
-        "Forecast values are estimates generated "
-        "from historical AGMARKNET price patterns "
-        "using machine learning/statistical forecasting. "
-        "They are not guaranteed market prices."
+        "Blue = past monthly average modal prices, amber = latest observed (present) price, "
+        "green = forecast. "
+        "Forecast values are statistical estimates, not guaranteed market prices."
     )
+else:
+    st.info("No historical or forecast price series is available for this selection.")
 
 
 # ============================================================
-# PAST + FUTURE
+# MARKET LOCATIONS (keep locations; do not display coordinates)
 # ============================================================
 
-if (
-    not history.empty
-    and not forecast.empty
-):
+st.write("### 🗺️ Mandi Locations")
+st.caption("All mandi markets reporting prices in the selected district.")
 
-    st.write(
-        "### 📊 Past, Present & Future Price Trend"
-    )
-
-    past = history[
-        [
-            "date",
-            "modal_price"
-        ]
-    ].copy()
-
-    past.rename(
-        columns={
-            "modal_price":
-                "Price"
-        },
-        inplace=True
-    )
-
-    future = forecast[
-        [
-            "date",
-            "modal_price"
-        ]
-    ].copy()
-
-    future.rename(
-        columns={
-            "modal_price":
-                "Price"
-        },
-        inplace=True
-    )
-
-    combined = pd.concat(
-        [
-            past,
-            future
-        ],
-        ignore_index=True
-    )
-
-    combined = (
-        combined
-        .drop_duplicates(
-            "date"
+locations = []
+with st.spinner("Locating mandi markets (the first lookup for a district can take a minute)..."):
+    try:
+        map_response = requests.post(
+            f"{API_BASE}/market-locations",
+            json={"state": state, "district": district, "crop": crop},
+            timeout=300,
         )
-        .sort_values(
-            "date"
-        )
-        .set_index(
-            "date"
-        )
-    )
+        if map_response.status_code == 200:
+            locations = map_response.json().get("locations", [])
+        else:
+            st.info("Market locations are temporarily unavailable for this selection.")
+    except requests.exceptions.RequestException:
+        st.info("Could not connect to the market-location service. Price results remain available.")
 
-    st.line_chart(
-        combined,
-        width="stretch"
-    )
+if locations:
+    locations_df = pd.DataFrame(locations)
+
+    # Normalize coordinate field names for map rendering only.
+    if "latitude" in locations_df.columns and "lat" not in locations_df.columns:
+        locations_df.rename(columns={"latitude": "lat"}, inplace=True)
+    if "longitude" in locations_df.columns and "lon" not in locations_df.columns:
+        locations_df.rename(columns={"longitude": "lon"}, inplace=True)
+
+    # Coordinates are used internally for the map but are never shown in a table.
+    if "lat" in locations_df.columns and "lon" in locations_df.columns:
+        locations_df["lat"] = pd.to_numeric(locations_df["lat"], errors="coerce")
+        locations_df["lon"] = pd.to_numeric(locations_df["lon"], errors="coerce")
+        valid_map = locations_df.dropna(subset=["lat", "lon"])
+        if not valid_map.empty:
+            st.pydeck_chart(build_market_map(valid_map), height=480)
+            st.caption(
+                f"{len(valid_map)} mandi markets in {district}. "
+                "Hover over a red dot to see the market name."
+            )
+        else:
+            st.info("Location coordinates were not available for these markets.")
+    else:
+        st.info("Location coordinates were not available for these markets.")
+else:
+    st.info("No mandi locations were found for this selection.")
 
 
 # ============================================================
@@ -554,339 +440,13 @@ if (
 
 
 # ============================================================
-# MARKET LOCATIONS
+# SUGGESTIONS PAGE LINK
 # ============================================================
 
-st.write(
-    "### 🗺️ Mandi Locations"
-)
-
-
-locations = []
-
-
-with st.spinner(
-    "Locating mandi markets..."
-):
-
-    try:
-
-        map_response = requests.post(
-
-            f"{API_BASE}/market-locations",
-
-            json={
-
-                "state":
-                    state,
-
-                "district":
-                    district,
-
-                "crop":
-                    crop
-            },
-
-            timeout=180
-        )
-
-        if map_response.status_code == 200:
-
-            locations = (
-                map_response
-                .json()
-                .get(
-                    "locations",
-                    []
-                )
-            )
-
-        else:
-
-            try:
-
-                error_detail = (
-                    map_response
-                    .json()
-                    .get(
-                        "detail",
-                        map_response.text
-                    )
-                )
-
-            except Exception:
-
-                error_detail = (
-                    map_response.text
-                )
-
-            st.warning(
-                f"Could not load market locations: "
-                f"{error_detail}"
-            )
-
-    except requests.exceptions.RequestException as exc:
-
-        st.warning(
-            "Could not connect to the market "
-            "location service."
-        )
-
-        st.caption(
-            str(exc)
-        )
-
-
-# ============================================================
-# SAFE MAP HANDLING
-# ============================================================
-
-if locations:
-
-    map_df = pd.DataFrame(
-        locations
-    )
-
-    # --------------------------------------------------------
-    # Handle possible backend field names
-    # --------------------------------------------------------
-
-    if (
-        "latitude" in map_df.columns
-        and "lat" not in map_df.columns
-    ):
-
-        map_df.rename(
-            columns={
-                "latitude":
-                    "lat"
-            },
-            inplace=True
-        )
-
-    if (
-        "longitude" in map_df.columns
-        and "lon" not in map_df.columns
-    ):
-
-        map_df.rename(
-            columns={
-                "longitude":
-                    "lon"
-            },
-            inplace=True
-        )
-
-    # --------------------------------------------------------
-    # Verify coordinates
-    # --------------------------------------------------------
-
-    if (
-        "lat" in map_df.columns
-        and "lon" in map_df.columns
-    ):
-
-        map_df["lat"] = pd.to_numeric(
-            map_df["lat"],
-            errors="coerce"
-        )
-
-        map_df["lon"] = pd.to_numeric(
-            map_df["lon"],
-            errors="coerce"
-        )
-
-        map_df = map_df.dropna(
-            subset=[
-                "lat",
-                "lon"
-            ]
-        )
-
-        if not map_df.empty:
-
-            st.map(
-                map_df[
-                    ["lat", "lon"]
-                ],
-                width="stretch"
-            )
-
-            table_columns = [
-                column
-                for column in [
-                    "market",
-                    "lat",
-                    "lon"
-                ]
-                if column in map_df.columns
-            ]
-
-            if table_columns:
-
-                st.dataframe(
-                    map_df[
-                        table_columns
-                    ],
-                    width="stretch",
-                    hide_index=True
-                )
-
-        else:
-
-            st.info(
-                "Market names were found, but "
-                "valid coordinates could not be obtained."
-            )
-
-    else:
-
-        st.info(
-            "Market locations were returned, "
-            "but latitude/longitude data is unavailable."
-        )
-
-else:
-
-    st.info(
-        "Couldn't locate mandi coordinates "
-        "for this selection."
-    )
-
-
-# ============================================================
-# CROP SUGGESTIONS
-# ============================================================
-
-st.write(
-    "### 🌾 Next-Year Crop Suggestions"
-)
-
-
-suggestions = []
-
-
-with st.spinner(
-    "Analyzing local market activity..."
-):
-
-    try:
-
-        suggestion_response = requests.post(
-
-            f"{API_BASE}/crop-suggestions",
-
-            json={
-
-                "state":
-                    state,
-
-                "district":
-                    district,
-
-                "selected_crop":
-                    crop
-            },
-
-            timeout=180
-        )
-
-        if suggestion_response.status_code == 200:
-
-            suggestions = (
-                suggestion_response
-                .json()
-                .get(
-                    "suggestions",
-                    []
-                )
-            )
-
-        else:
-
-            try:
-
-                error_detail = (
-                    suggestion_response
-                    .json()
-                    .get(
-                        "detail",
-                        suggestion_response.text
-                    )
-                )
-
-            except Exception:
-
-                error_detail = (
-                    suggestion_response.text
-                )
-
-            st.warning(
-                f"Could not generate crop suggestions: "
-                f"{error_detail}"
-            )
-
-    except requests.exceptions.RequestException as exc:
-
-        st.warning(
-            "Could not connect to the crop "
-            "suggestion service."
-        )
-
-        st.caption(
-            str(exc)
-        )
-
-
-if suggestions:
-
-    suggestion_df = pd.DataFrame(
-        suggestions
-    )
-
-    display_columns = [
-
-        "crop",
-
-        "average_price",
-
-        "market_count",
-
-        "observations",
-
-        "trend_percent"
-    ]
-
-    available_columns = [
-
-        column
-
-        for column in display_columns
-
-        if column in suggestion_df.columns
-    ]
-
-    st.dataframe(
-        suggestion_df[
-            available_columns
-        ],
-        width="stretch",
-        hide_index=True
-    )
-
-    st.caption(
-        "Suggestions are based on observed market "
-        "activity, prices, market coverage and recent "
-        "price trends in the selected district. "
-        "They are market-data indicators, not guaranteed demand."
-    )
-
-else:
-
-    st.info(
-        "No crop suggestion data was available "
-        "for this district."
-    )
+st.write("### 🌱 Crop Suggestions")
+st.caption("Open a separate page to review market-based crop suggestions for this district.")
+if st.button("View Crop Suggestions →", type="primary", width="stretch"):
+    st.switch_page("pages/suggestions.py")
 
 
 # ============================================================
