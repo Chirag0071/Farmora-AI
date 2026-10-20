@@ -143,13 +143,12 @@ st.markdown(
 
     /* Glass card */
     .glass-card {
-        background: rgba(10, 12, 17, 0.78);
-        backdrop-filter: blur(10px);
-        border-radius: 12px;
-        padding: 30px;
+        background: transparent;
+        padding: 10px 0;
         color: white;
+        text-shadow: 0 2px 8px rgba(0,0,0,0.8);
         max-width: 900px;
-        margin: 70px auto;
+        margin: 30px auto;
     }
 
     .glass-card h1,
