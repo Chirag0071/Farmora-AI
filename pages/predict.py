@@ -83,8 +83,16 @@ def get_india_states():
         )
 
     except Exception:
-
-        return []
+        # Keep the form usable when the third-party states API is unavailable.
+        return [
+            "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+            "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
+            "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
+            "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana",
+            "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands",
+            "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir",
+            "Ladakh", "Lakshadweep", "Puducherry"
+        ]
 
 
 @st.cache_data(
@@ -133,11 +141,7 @@ india_states = get_india_states()
 
 
 if not india_states:
-
-    st.error(
-        "Couldn't load the list of states right now. "
-        "Please check your internet connection."
-    )
+    st.warning("Could not load state names from the online service. You can still enter your district manually if needed.")
 
 
 # ============================================================
