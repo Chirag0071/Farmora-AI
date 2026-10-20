@@ -19,7 +19,8 @@ st.set_page_config(
 # Background Image
 # --------------------------------------------------
 
-image_path = Path("assets/cornfield.jpg")
+BASE_DIR = Path(__file__).resolve().parent
+image_path = BASE_DIR / "assets" / "cornfield.jpg"
 
 if image_path.exists():
 
@@ -201,6 +202,14 @@ result_page = st.Page(
 )
 
 
+# Hidden suggestions page
+suggestions_page = st.Page(
+    "pages/suggestions.py",
+    title="Suggestions",
+    icon=":material/eco:"
+)
+
+
 # --------------------------------------------------
 # Navigation
 # --------------------------------------------------
@@ -210,7 +219,8 @@ pg = st.navigation([
     about_page,
     help_page,
     predict_page,
-    result_page
+    result_page,
+    suggestions_page
 ])
 
 pg.run()
