@@ -9,6 +9,8 @@ from functools import lru_cache
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from utils.crops import commodity_candidates
 
@@ -29,9 +31,36 @@ HISTORICAL_RESOURCE_ID = "35985678-0d79-46b4-9ed6-6f13308a1d24"
 
 RESOURCE_IDS = [CURRENT_RESOURCE_ID, HISTORICAL_RESOURCE_ID]
 
+# data.gov.in sometimes rejects the default python-requests identity.
 HEADERS = {
-    "User-Agent": "Farmora/1.0"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
 }
+
+# Optional outbound proxy (e.g. an India-based proxy) if the host's IP is blocked.
+PROXY_URL = os.getenv("AGMARKNET_PROXY")
+
+
+def _build_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    if PROXY_URL:
+        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    return session
+
+
+_SESSION = _build_session()
 
 # Don't let one request hang forever.
 REQUEST_TIMEOUT = 20
@@ -40,6 +69,7 @@ REQUEST_TIMEOUT = 20
 # paging below handles that.)
 PAGE_SIZE = 100
 MAX_PAGES = 5
+MAX_PAGES_ALL_CROPS = 15  # district-wide listing (used for the market map)
 
 CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "agmarknet_cache"
 CACHE_MAX_AGE_DAYS = 30
@@ -113,7 +143,7 @@ def _request_page(
 
     try:
 
-        response = requests.get(
+        response = _SESSION.get(
             f"https://api.data.gov.in/resource/{resource_id}",
             params=params,
             headers=HEADERS,
@@ -129,9 +159,13 @@ def _request_page(
         )
 
     except requests.exceptions.RequestException as exc:
-        # Do not include the prepared URL: it contains the API key query parameter.
+        # Never include the URL (it contains the API key).
+        reason = str(exc).replace(str(API_KEY), "***")[:300]
+        print(f"AGMARKNET connection failure: {type(exc).__name__}: {reason}")
         raise AGMARKNETError(
-            f"Unable to connect to AGMARKNET ({type(exc).__name__}). Check internet access, firewall/proxy settings, and api.data.gov.in availability."
+            f"Unable to connect to AGMARKNET ({type(exc).__name__}). "
+            "The server could not reach api.data.gov.in - it may be blocking this "
+            "server's location, or be temporarily down."
         )
 
     if response.status_code != 200:
@@ -216,7 +250,7 @@ def _fetch_resource(resource_id, state, district, commodity):
         collected = []
         offset = 0
 
-        for page_number in range(MAX_PAGES):
+        for page_number in range(MAX_PAGES if commodity else MAX_PAGES_ALL_CROPS):
 
             data = _request_page(
                 resource_id=resource_id,
