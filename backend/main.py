@@ -1,10 +1,6 @@
-# backend/main.py
-
 from typing import Optional
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
-
 from backend.services.agmarknet import (
     AGMARKNETError,
     get_price_history,
@@ -96,8 +92,25 @@ class SuggestionRequest(BaseModel):
 
 
 # ============================================================
-# HEALTH
+# ROOT / HEALTH
 # ============================================================
+
+@app.get("/", include_in_schema=False)
+def root():
+
+    return {
+        "service": "Farmora API",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+
+    return Response(status_code=204)
+
 
 @app.get("/health")
 def health():
