@@ -1,10 +1,6 @@
-# backend/main.py
-
 from typing import Optional
-
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
-
 from backend.services.agmarknet import (
     AGMARKNETError,
     get_price_history,
@@ -108,56 +104,6 @@ def root():
         "docs": "/docs",
         "health": "/health"
     }
-
-
-@app.get("/diagnose", include_in_schema=False)
-def diagnose():
-    """Open /diagnose in a browser to test whether this server can reach data.gov.in."""
-
-    import os
-    import requests
-
-    from backend.services.agmarknet import (
-        CURRENT_RESOURCE_ID,
-        HEADERS,
-        REQUEST_TIMEOUT,
-    )
-
-    key = os.getenv("AGMARKNET_API_KEY")
-    result = {"api_key_set": bool(key)}
-
-    for name, url in (
-        ("data_gov_in_home", "https://api.data.gov.in/"),
-        (
-            "price_api",
-            f"https://api.data.gov.in/resource/{CURRENT_RESOURCE_ID}",
-        ),
-    ):
-        try:
-            response = requests.get(
-                url,
-                params={"api-key": key, "format": "json", "limit": 1} if "resource" in url else None,
-                headers=HEADERS,
-                timeout=REQUEST_TIMEOUT,
-            )
-            result[name] = {
-                "reachable": True,
-                "http_status": response.status_code,
-                "preview": response.text[:150].replace(str(key), "***") if key else response.text[:150],
-            }
-        except Exception as exc:
-            result[name] = {
-                "reachable": False,
-                "error": f"{type(exc).__name__}: {str(exc)[:200]}".replace(str(key), "***") if key else f"{type(exc).__name__}",
-            }
-
-    try:
-        ip = requests.get("https://api.ipify.org", timeout=8).text
-        result["server_public_ip"] = ip
-    except Exception:
-        result["server_public_ip"] = "unknown"
-
-    return result
 
 
 @app.get("/favicon.ico", include_in_schema=False)
