@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 .env
 .vscode/
-.streamlit/secrets.tomldata/
+.streamlit/secrets.toml
+data/
