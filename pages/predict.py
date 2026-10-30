@@ -1,4 +1,5 @@
 import os
+import time
 
 import requests
 import streamlit as st
@@ -15,14 +16,6 @@ API_BASE = os.environ.get(
     "http://127.0.0.1:8000"
 ).rstrip("/")
 
-
-STATES_API = (
-    "https://countriesnow.space/api/v0.1/countries/states"
-)
-
-CITIES_API = (
-    "https://countriesnow.space/api/v0.1/countries/state/cities"
-)
 
 
 # ============================================================
@@ -43,89 +36,99 @@ st.markdown(
 
 
 # ============================================================
-# LOCATION HELPERS
+# LOCATION HELPERS  (state / district names come from AGMARKNET itself)
 # ============================================================
+
+def _wait_for_backend(path, params=None, max_wait=240):
+    """Call the backend until the AGMARKNET location list is ready.
+    Free hosts put the backend to sleep when idle; waking takes about a minute, so connection
+    errors and 5xx answers are treated as "still waking up" and retried."""
+
+    waited = 0
+    last_problem = "backend not reachable"
+
+    while waited < max_wait:
+
+        try:
+
+            response = requests.get(
+                f"{API_BASE}{path}",
+                params=params,
+                timeout=30
+            )
+
+            if response.status_code < 500:
+
+                response.raise_for_status()
+
+                data = response.json()
+
+                if data.get("status") == "ready":
+                    return data
+
+                if data.get("status") == "error":
+                    raise RuntimeError(data.get("message") or "AGMARKNET locations unavailable")
+
+            else:
+
+                last_problem = f"backend answered HTTP {response.status_code}"
+
+        except requests.exceptions.RequestException as exc:
+
+            last_problem = type(exc).__name__
+
+        time.sleep(3)
+        waited += 3
+
+    raise RuntimeError(f"Timed out while loading AGMARKNET locations ({last_problem})")
+
 
 @st.cache_data(
     show_spinner=False,
-    ttl=86400
+    ttl=3600
 )
+def _load_states():
+    # Errors are not cached by Streamlit, so a failed load is retried on the next run.
+    return _wait_for_backend("/locations/states")["states"]
+
+
+@st.cache_data(
+    show_spinner=False,
+    ttl=3600
+)
+def _load_districts(state_name):
+    return _wait_for_backend(
+        "/locations/districts",
+        params={"state": state_name}
+    )["districts"]
+
+
 def get_india_states():
 
     try:
 
-        response = requests.post(
-            STATES_API,
-            json={
-                "country": "India"
-            },
-            timeout=10
+        with st.spinner("Loading states from AGMARKNET (first load can take a minute)..."):
+            return _load_states()
+
+    except Exception as exc:
+
+        st.error(
+            "Could not load states from AGMARKNET. "
+            "Make sure the backend is running and your API key is valid, then reload."
         )
+        st.caption(str(exc))
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        states = [
-            item["name"]
-            for item in
-            data.get(
-                "data",
-                {}
-            ).get(
-                "states",
-                []
-            )
-        ]
-
-        return sorted(
-            states
-        )
-
-    except Exception:
-        # Keep the form usable when the third-party states API is unavailable.
-        return [
-            "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
-            "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
-            "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
-            "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana",
-            "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands",
-            "Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir",
-            "Ladakh", "Lakshadweep", "Puducherry"
-        ]
+        return []
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=86400
-)
 def get_state_districts(
     state_name
 ):
 
     try:
 
-        response = requests.post(
-
-            CITIES_API,
-
-            json={
-                "country": "India",
-                "state": state_name
-            },
-
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        return sorted(
-            data.get(
-                "data",
-                []
-            )
+        return _load_districts(
+            state_name
         )
 
     except Exception:
@@ -138,10 +141,6 @@ def get_state_districts(
 # ============================================================
 
 india_states = get_india_states()
-
-
-if not india_states:
-    st.warning("Could not load state names from the online service. You can still enter your district manually if needed.")
 
 
 # ============================================================
