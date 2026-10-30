@@ -1,9 +1,9 @@
-# backend/services/agmarknet.py
-
 import os
-import json
-import hashlib
-from pathlib import Path
+import re
+import time
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import pandas as pd
@@ -29,24 +29,51 @@ HISTORICAL_RESOURCE_ID = "35985678-0d79-46b4-9ed6-6f13308a1d24"
 
 RESOURCE_IDS = [CURRENT_RESOURCE_ID, HISTORICAL_RESOURCE_ID]
 
+# data.gov.in sits behind a firewall that can reject bare python-requests traffic coming from
+# cloud servers (HTTP 502). A descriptive, browser-compatible User-Agent avoids that.
 HEADERS = {
-    "User-Agent": "Farmora/1.0"
+    "User-Agent": os.getenv(
+        "AGMARKNET_USER_AGENT",
+        "Mozilla/5.0 (compatible; Farmora/1.0; agriculture price project)"
+    ),
+    "Accept": "application/json",
 }
 
 # Don't let one request hang forever.
 REQUEST_TIMEOUT = 20
 
-# Records requested per page. (Some API keys cap this at 10;
-# paging below handles that.)
-PAGE_SIZE = 100
-MAX_PAGES = 5
+# ------------------------------------------------------------------
+# FIX: the old code stopped after 5 pages x 100 = 500 records, so the
+# history was truncated and the ML model starved. We now keep paging
+# until the API has no more rows, bounded by a record cap and a time cap.
+# All three can be changed from .env.
+# ------------------------------------------------------------------
+PAGE_SIZE = int(os.getenv("AGMARKNET_PAGE_SIZE", "1000"))
+MAX_RECORDS = int(os.getenv("AGMARKNET_MAX_RECORDS", "100000"))      # ~5 years of daily rows for a district + crop
+MAX_FETCH_SECONDS = int(os.getenv("AGMARKNET_MAX_FETCH_SECONDS", "90"))
+# Parallel requests. The sample key on data.gov.in returns only 10 rows per call, so a
+# 5-year history needs hundreds of calls - they are sent in parallel to stay fast.
+FETCH_WORKERS = int(os.getenv("AGMARKNET_WORKERS", "3"))
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "agmarknet_cache"
-CACHE_MAX_AGE_DAYS = 30
+# Monthly history / forecast training data starts in this year (2015 -> today).
+# If the API has nothing that old, the oldest data it does have is used.
+HISTORY_START_YEAR = int(os.getenv("FARMORA_HISTORY_START_YEAR", "2015"))
 
 
 class AGMARKNETError(Exception):
     pass
+
+
+_COOLDOWN_UNTIL = 0.0          # shared pause after a 429, so all threads back off together
+_RATE_STREAK = 0
+
+
+class AGMARKNETRateLimit(AGMARKNETError):
+    pass
+
+
+class AGMARKNETFilterError(AGMARKNETError):
+    """HTTP 4xx from the API - usually means the filter field name/style is wrong."""
 
 
 _CANONICAL_KEYS = {
@@ -73,13 +100,144 @@ def _normalize_record(record: dict) -> dict:
 
 
 # ============================================================
+# STATE / DISTRICT NAME MATCHING
+# ============================================================
+# The dropdowns come from countriesnow.space, but AGMARKNET spells many
+# states/districts differently, so a plain filter returns 0 rows.
+# We try the original spelling first, then known alternatives.
+
+STATE_ALIASES = {
+    "delhi": ["NCT of Delhi", "Delhi"],
+    "nct of delhi": ["NCT of Delhi", "Delhi"],
+    "uttarakhand": ["Uttrakhand", "Uttarakhand"],
+    "chhattisgarh": ["Chattisgarh", "Chhattisgarh"],
+    "odisha": ["Odisha", "Orissa"],
+    "puducherry": ["Pondicherry", "Puducherry"],
+    "andaman and nicobar islands": ["Andaman and Nicobar", "Andaman and Nicobar Islands"],
+    "jammu and kashmir": ["Jammu and Kashmir", "Jammu & Kashmir"],
+    "dadra and nagar haveli and daman and diu": ["Dadra and Nagar Haveli", "Daman and Diu"],
+}
+
+_DISTRICT_PAIRS = [
+    ("Gurugram", "Gurgaon"), ("Prayagraj", "Allahabad"), ("Ayodhya", "Faizabad"),
+    ("Bengaluru", "Bangalore"), ("Bengaluru Urban", "Bangalore"), ("Bengaluru Rural", "Bangalore Rural"),
+    ("Mysuru", "Mysore"), ("Belagavi", "Belgaum"), ("Kalaburagi", "Gulbarga"),
+    ("Vijayapura", "Bijapur"), ("Ballari", "Bellary"), ("Shivamogga", "Shimoga"),
+    ("Tumakuru", "Tumkur"), ("Mangaluru", "Dakshina Kannada"),
+    ("Thiruvananthapuram", "Trivandrum"), ("Kozhikode", "Calicut"), ("Alappuzha", "Alleppey"),
+    ("Visakhapatnam", "Vishakhapatnam"), ("Vadodara", "Baroda"), ("Puducherry", "Pondicherry"),
+    ("Ahilyanagar", "Ahmednagar"), ("Chhatrapati Sambhajinagar", "Aurangabad"),
+    ("Dharashiv", "Osmanabad"), ("Kanpur Nagar", "Kanpur"), ("Lakhimpur Kheri", "Kheri"),
+    ("Hathras", "Mahamaya Nagar"), ("Amethi", "Sultanpur"), ("Prayagraj", "Allahabad"),
+    ("Bardhaman", "Burdwan"), ("Purba Bardhaman", "Burdwan"), ("Kolkata", "Calcutta"),
+    ("Thoothukkudi", "Tuticorin"), ("Tiruchirappalli", "Trichy"), ("Kancheepuram", "Kanchipuram"),
+    ("Nashik", "Nasik"), ("Raigad", "Raigarh"), ("Sri Ganganagar", "Ganganagar"),
+    ("Mumbai", "Mumbai City"), ("Jalandhar", "Jullundur"), ("Pune", "Poona"),
+]
+DISTRICT_ALIASES: dict[str, list[str]] = {}
+for _a, _b in _DISTRICT_PAIRS:
+    DISTRICT_ALIASES.setdefault(_a.lower(), []).append(_b)
+    DISTRICT_ALIASES.setdefault(_b.lower(), []).append(_a)
+
+
+def _unique(items):
+    seen, out = set(), []
+    for item in items:
+        item = re.sub(r"\s+", " ", str(item)).strip()
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+def _state_variants(state: str) -> list[str]:
+    base = state.strip()
+    return _unique([base] + STATE_ALIASES.get(base.lower(), []) + [base.replace("&", "and")])
+
+
+def _district_variants(district: str) -> list[str]:
+    base = district.strip()
+    stripped = re.sub(r"\b(district|dist\.?|urban|rural|city)\b", "", base, flags=re.I)
+    candidates = [base, stripped, base.title(), base.replace("&", "and")]
+    for name in list(candidates):
+        candidates += DISTRICT_ALIASES.get(re.sub(r"\s+", " ", name).strip().lower(), [])
+    return _unique(candidates)
+
+
+_RESOLVED_NAMES: dict[tuple[str, str], tuple[str, str]] = {}
+
+
+def _same(a, b) -> bool:
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _row_matches(record, state, district, commodity) -> bool:
+    """True if a returned row really belongs to the requested state/district/commodity.
+    Guards against a filter name the API silently ignores (it would then return ANY state's rows)."""
+    return (
+        (not state or _same(record.get("State", ""), state))
+        and (not district or _same(record.get("District", ""), district))
+        and (not commodity or _same(record.get("Commodity", ""), commodity))
+    )
+
+
+def _exists(state: str, district: str | None) -> bool:
+    """True if any dataset has at least one row for this state(/district). One tiny request each."""
+    for resource_id in RESOURCE_IDS:
+        for title_case in (True, False):
+            try:
+                data = _request_page(resource_id, state, district, limit=1, title_case_filters=title_case)
+            except AGMARKNETFilterError:
+                continue
+            records = data.get("records", [])
+            if records:
+                if _row_matches(records[0], state, district, None):
+                    return True
+                continue        # this filter style was ignored by the API -> try the other one
+            break               # request worked but returned nothing; no need for the other filter style
+    return False
+
+
+def resolve_names(state: str, district: str) -> tuple[str, str]:
+    """Return the (state, district) spelling that AGMARKNET actually has data for."""
+    key = (state.strip().lower(), district.strip().lower())
+    if key in _RESOLVED_NAMES:
+        return _RESOLVED_NAMES[key]
+
+    try:
+        if _exists(state, district):                     # usual case: 1-2 requests
+            result = (state, district)
+        else:
+            result = None
+            for s in _state_variants(state):
+                if not _exists(s, None):
+                    continue
+                for d in _district_variants(district):
+                    if _exists(s, d):
+                        result = (s, d)
+                        break
+                if result:
+                    break
+            if result is None:
+                result = (state, district)               # nothing matched; keep original
+                print(f"AGMARKNET: no rows found for {district}, {state} under any known spelling.")
+            else:
+                print(f"AGMARKNET: matched {district}, {state} -> {result[1]}, {result[0]}")
+    except AGMARKNETError:
+        return state, district                           # API problem: don't cache, let the real fetch report it
+
+    _RESOLVED_NAMES[key] = result
+    return result
+
+
+# ============================================================
 # API REQUEST
 # ============================================================
 
 def _request_page(
     resource_id: str,
-    state: str,
-    district: str,
+    state: str | None,
+    district: str | None,
     commodity: str | None = None,
     limit: int = PAGE_SIZE,
     offset: int = 0,
@@ -103,13 +261,24 @@ def _request_page(
         "format": "json",
         "limit": limit,
         "offset": offset,
-        f"filters[{names[0]}]": state,
-        f"filters[{names[1]}]": district,
     }
+
+    if state:
+
+        params[f"filters[{names[0]}]"] = state
+
+    if district:
+
+        params[f"filters[{names[1]}]"] = district
 
     if commodity:
 
         params[f"filters[{names[2]}]"] = commodity
+
+    global _COOLDOWN_UNTIL, _RATE_STREAK
+    wait = _COOLDOWN_UNTIL - time.monotonic()
+    if wait > 0:
+        time.sleep(min(wait, 20))
 
     try:
 
@@ -134,9 +303,29 @@ def _request_page(
             f"Unable to connect to AGMARKNET ({type(exc).__name__}). Check internet access, firewall/proxy settings, and api.data.gov.in availability."
         )
 
+    if response.status_code == 429:
+        _RATE_STREAK = min(_RATE_STREAK + 1, 6)
+        try:
+            pause = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            pause = 3.0 * _RATE_STREAK
+        _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, time.monotonic() + min(pause, 20))
+        raise AGMARKNETRateLimit(
+            "AGMARKNET rate limit reached (HTTP 429). The sample API key allows very few "
+            "requests; wait a minute or use your own data.gov.in key."
+        )
+    if response.status_code == 200:
+        _RATE_STREAK = 0
+
     if response.status_code != 200:
 
-        raise AGMARKNETError(
+        error_class = (
+            AGMARKNETFilterError
+            if response.status_code in (400, 404, 422)
+            else AGMARKNETError
+        )
+
+        raise error_class(
             f"AGMARKNET returned HTTP "
             f"{response.status_code}: "
             f"{response.text[:300]}"
@@ -175,77 +364,104 @@ def _request_page(
 
 
 # ============================================================
-# DISK CACHE HELPERS
-# ============================================================
-def _cache_file(state: str, district: str, commodity: str | None, resource_id: str = HISTORICAL_RESOURCE_ID) -> Path:
-    parts = [state.strip().lower(), district.strip().lower(), (commodity or "").strip().lower()]
-    if resource_id != HISTORICAL_RESOURCE_ID:
-        parts.append(resource_id)  # historical keeps the original key, so old cache files still work
-    key = json.dumps(parts, ensure_ascii=False)
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return CACHE_DIR / f"{digest}.json"
-
-def _read_cached_records(state: str, district: str, commodity: str | None, resource_id: str = HISTORICAL_RESOURCE_ID):
-    path = _cache_file(state, district, commodity, resource_id)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        records = payload.get("records", []) if isinstance(payload.get("records"), list) else []
-        return [_normalize_record(r) for r in records if isinstance(r, dict)]
-    except (OSError, ValueError, AttributeError):
-        return []
-
-def _write_cached_records(state: str, district: str, commodity: str | None, records, resource_id: str = HISTORICAL_RESOURCE_ID):
-    path = _cache_file(state, district, commodity, resource_id)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"saved_at": pd.Timestamp.now(tz="UTC").isoformat(), "records": records}, ensure_ascii=False), encoding="utf-8")
-    except OSError as exc:
-        print(f"Could not save AGMARKNET cache: {exc}")
-
-
-# ============================================================
 # FETCH RECORDS
 # ============================================================
 
-def _fetch_resource(resource_id, state, district, commodity):
-    """Fetch all pages from one dataset. Tries lowercase filter names first,
-    then Title-case, because datasets differ."""
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
-    for title_case in (False, True):
 
-        collected = []
-        offset = 0
+def _fetch_offsets(resource_id, state, district, commodity, title_case, offsets, step, deadline):
+    """Fetch many pages in parallel. Pages are requested in shuffled order, so even if the
+    time limit hits first, the rows we got cover ALL years evenly (not just the oldest)."""
 
-        for page_number in range(MAX_PAGES):
+    failed = []
 
-            data = _request_page(
-                resource_id=resource_id,
-                state=state,
-                district=district,
-                commodity=commodity,
-                limit=PAGE_SIZE,
-                offset=offset,
-                title_case_filters=title_case
+    def work(offset):
+        for attempt in range(6):
+            if time.monotonic() > deadline:
+                return []
+            try:
+                data = _request_page(
+                    resource_id, state, district, commodity,
+                    limit=step, offset=offset, title_case_filters=title_case,
+                )
+                return data.get("records", [])
+            except AGMARKNETFilterError:
+                return []
+            except AGMARKNETError:
+                time.sleep(0.5 * (attempt + 1))      # hiccup: back off (429 also uses shared cooldown)
+        failed.append(offset)
+        return []
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        for chunk in pool.map(work, offsets):
+            rows.extend(chunk)
+    if failed:
+        print(f"AGMARKNET: {len(failed)} of {len(offsets)} pages failed (rate limit / timeout). "
+              f"Lower AGMARKNET_WORKERS or use your own API key.")
+    return rows
+
+
+def _fetch_resource(resource_id, state, district, commodity, max_seconds=None):
+    """Fetch (up to MAX_RECORDS / MAX_FETCH_SECONDS) rows from one dataset: first page to learn
+    the total + the server's real page size, then all remaining pages in parallel.
+    Tries the documented Title-case filter names (filters[State]) first, then lowercase."""
+
+    last_error = None
+    request_worked = False
+    deadline = time.monotonic() + (max_seconds or MAX_FETCH_SECONDS)
+
+    for title_case in (True, False):
+
+        try:
+
+            first = _request_page(
+                resource_id, state, district, commodity,
+                limit=PAGE_SIZE, offset=0, title_case_filters=title_case
             )
 
-            records = data.get("records", [])
+        except AGMARKNETFilterError as exc:
+            last_error = exc            # wrong filter style -> try the other one
+            continue
 
-            if not records:
-                break
+        request_worked = True
+        collected = list(first.get("records", []))
 
-            collected.extend(records)
-            offset += len(records)
+        if not collected:
+            continue
 
-            try:
-                total = int(data.get("total", 0))
-            except (TypeError, ValueError):
-                total = 0
+        if not _row_matches(collected[0], state, district, commodity):
+            print(f"AGMARKNET: filter style ignored by {resource_id[:8]} (rows do not match "
+                  f"{state}/{district}/{commodity}); trying the other style.")
+            continue
 
-            if total and offset >= total:
-                break
+        total = min(_to_int(first.get("total")), MAX_RECORDS)
+        step = len(collected)           # the server may cap the page size (e.g. 10)
 
-        if collected:
-            return collected
+        if total > step:
+
+            offsets = list(range(step, total, step))
+            random.Random(7).shuffle(offsets)
+
+            collected += _fetch_offsets(
+                resource_id, state, district, commodity,
+                title_case, offsets, step, deadline
+            )
+
+            print(
+                f"AGMARKNET {resource_id[:8]}: fetched {len(collected)} of {total} rows "
+                f"(page size {step})"
+            )
+
+        return collected
+
+    if last_error and not request_worked:
+        raise last_error
 
     return []
 
@@ -273,35 +489,33 @@ def _dedupe(records):
     return unique_records
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=8)
 def _fetch_cached_in_memory(state, district, commodity, day):
     # `day` is part of the key so the in-memory cache refreshes daily.
     return tuple(_fetch_all(state, district, commodity))
 
 
 def _fetch_all(state, district, commodity):
+    """Always live: queries both data.gov.in datasets. No disk cache, no offline fallback."""
 
     all_records = []
     errors = []
+
+    # Use the spelling AGMARKNET really has (e.g. Delhi -> NCT of Delhi).
+    api_state, api_district = resolve_names(state, district)
 
     for resource_id in RESOURCE_IDS:
 
         try:
 
-            records = _fetch_resource(resource_id, state, district, commodity)
-
-            if records:
-                _write_cached_records(state, district, commodity, records, resource_id)
+            all_records.extend(
+                _fetch_resource(resource_id, api_state, api_district, commodity)
+            )
 
         except AGMARKNETError as exc:
 
             errors.append(exc)
-            records = _read_cached_records(state, district, commodity, resource_id)
-
-            if records:
-                print(f"AGMARKNET unavailable for {resource_id}; using {len(records)} cached records. Error: {exc}")
-
-        all_records.extend(records)
+            print(f"AGMARKNET request failed for {resource_id}: {exc}")
 
     if not all_records and errors:
         raise errors[0]
@@ -362,73 +576,16 @@ def records_to_dataframe(
 
         rows.append({
 
-            "state":
-                str(
-                    record.get(
-                        "State",
-                        ""
-                    )
-                ).strip(),
-
-            "district":
-                str(
-                    record.get(
-                        "District",
-                        ""
-                    )
-                ).strip(),
-
-            "market":
-                str(
-                    record.get(
-                        "Market",
-                        ""
-                    )
-                ).strip(),
-
-            "commodity":
-                str(
-                    record.get(
-                        "Commodity",
-                        ""
-                    )
-                ).strip(),
-
-            "variety":
-                str(
-                    record.get(
-                        "Variety",
-                        ""
-                    )
-                ).strip(),
-
-            "grade":
-                str(
-                    record.get(
-                        "Grade",
-                        ""
-                    )
-                ).strip(),
-
-            "arrival_date":
-                record.get(
-                    "Arrival_Date"
-                ),
-
-            "min_price":
-                record.get(
-                    "Min_Price"
-                ),
-
-            "modal_price":
-                record.get(
-                    "Modal_Price"
-                ),
-
-            "max_price":
-                record.get(
-                    "Max_Price"
-                )
+            "state": str(record.get("State", "")).strip(),
+            "district": str(record.get("District", "")).strip(),
+            "market": str(record.get("Market", "")).strip(),
+            "commodity": str(record.get("Commodity", "")).strip(),
+            "variety": str(record.get("Variety", "")).strip(),
+            "grade": str(record.get("Grade", "")).strip(),
+            "arrival_date": record.get("Arrival_Date"),
+            "min_price": record.get("Min_Price"),
+            "modal_price": record.get("Modal_Price"),
+            "max_price": record.get("Max_Price"),
         })
 
     df = pd.DataFrame(
@@ -461,7 +618,8 @@ def records_to_dataframe(
         )
 
     # --------------------------------------------------------
-    # Remove invalid rows
+    # Remove invalid rows (missing date/price, or non-positive price:
+    # AGMARKNET sometimes reports 0 for "no trade", which would wreck the ML model)
     # --------------------------------------------------------
 
     df = df.dropna(
@@ -470,6 +628,8 @@ def records_to_dataframe(
             "modal_price"
         ]
     )
+
+    df = df[df["modal_price"] > 0]
 
     # Blank min/max prices would become NaN and break JSON output;
     # fall back to the modal price.
@@ -526,6 +686,258 @@ def get_price_history(
         )
 
     return df
+
+
+# ============================================================
+# STATES AND DISTRICTS, CONFIRMED BY THE AGMARKNET API ITSELF
+# ============================================================
+# The dropdowns must use AGMARKNET's own spelling (e.g. "NCT of Delhi", "Uttrakhand").
+#
+# States   : every Indian state / UT is asked of the API ("do you have rows for this name?").
+#            Only names the API confirms are shown, in the spelling the API accepted.
+#            This is ~40 tiny requests, so the list appears within seconds.
+# Districts: collected per state, when a state is chosen: all of today's rows (live dataset)
+#            plus a spread-out sample of the historical archive, so districts that did not
+#            report today still show up.
+
+# Each group = the spellings AGMARKNET may use for one state / UT (first one that works wins).
+INDIA_STATE_GROUPS = [
+    ["Andaman and Nicobar", "Andaman and Nicobar Islands", "Andaman & Nicobar Islands"],
+    ["Andhra Pradesh"], ["Arunachal Pradesh"], ["Assam"], ["Bihar"], ["Chandigarh"],
+    ["Chattisgarh", "Chhattisgarh"],
+    ["Dadra and Nagar Haveli", "Dadra & Nagar Haveli", "Dadra and Nagar Haveli and Daman and Diu"],
+    ["Daman and Diu", "Daman & Diu"],
+    ["NCT of Delhi", "Delhi"],
+    ["Goa"], ["Gujarat"], ["Haryana"], ["Himachal Pradesh"],
+    ["Jammu and Kashmir", "Jammu & Kashmir"],
+    ["Jharkhand"], ["Karnataka"], ["Kerala"], ["Ladakh"], ["Lakshadweep"],
+    ["Madhya Pradesh"], ["Maharashtra"], ["Manipur"], ["Meghalaya"], ["Mizoram"], ["Nagaland"],
+    ["Odisha", "Orissa"],
+    ["Pondicherry", "Puducherry"],
+    ["Punjab"], ["Rajasthan"], ["Sikkim"], ["Tamil Nadu"], ["Telangana"], ["Tripura"],
+    ["Uttar Pradesh"],
+    ["Uttrakhand", "Uttarakhand"],
+    ["West Bengal"],
+]
+
+DISTRICT_SAMPLE_PAGES = int(os.getenv("FARMORA_DISTRICT_SAMPLE_PAGES", "300"))
+DISTRICT_SECONDS = int(os.getenv("FARMORA_DISTRICT_SECONDS", "40"))
+
+_STATES = {"day": None, "data": None, "loading": False, "error": None, "failed_at": 0.0}
+_DISTRICTS = {}
+_LOCATIONS_LOCK = threading.Lock()
+
+
+def _today():
+    return pd.Timestamp.now().strftime("%Y-%m-%d")
+
+
+def _probe_states():
+
+    errors = []
+
+    def check(group):
+        for name in group:
+            for attempt in range(4):                  # throttled (429) / timeout: wait and retry
+                try:
+                    if _exists(name, None):
+                        return name
+                    break                             # API answered: no rows under this spelling
+                except AGMARKNETError as exc:
+                    if attempt == 3:
+                        errors.append(exc)
+                    else:
+                        time.sleep(0.7 * (attempt + 1))
+        return None
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        found = [name for name in pool.map(check, INDIA_STATE_GROUPS) if name]
+
+    if not found:
+        raise errors[0] if errors else AGMARKNETError("AGMARKNET returned no states.")
+
+    print(f"AGMARKNET states confirmed by API: {len(found)} -> {sorted(found)}")
+
+    return sorted(found)
+
+
+def _states_worker(today):
+
+    try:
+
+        data = _probe_states()
+
+        with _LOCATIONS_LOCK:
+            _STATES.update(day=today, data=data, error=None)
+
+    except Exception as exc:
+
+        print("State list failed:", repr(exc))
+
+        with _LOCATIONS_LOCK:
+            _STATES.update(error=str(exc), failed_at=time.monotonic())
+
+    finally:
+
+        with _LOCATIONS_LOCK:
+            _STATES["loading"] = False
+
+
+def ensure_location_index():
+    """Start (or refresh once a day) the background check of which states AGMARKNET has."""
+
+    today = _today()
+
+    with _LOCATIONS_LOCK:
+
+        fresh = _STATES["data"] is not None and _STATES["day"] == today
+        retry_later = _STATES["error"] and time.monotonic() - _STATES["failed_at"] < 30
+
+        if fresh or _STATES["loading"] or retry_later:
+            return
+
+        _STATES["loading"] = True
+
+    threading.Thread(target=_states_worker, args=(today,), daemon=True).start()
+
+
+def get_states_status():
+    """{'status': 'ready' | 'loading' | 'error', 'states': [...], 'error': str}"""
+
+    ensure_location_index()
+
+    with _LOCATIONS_LOCK:
+
+        if _STATES["data"] is not None:
+            return {"status": "ready", "states": list(_STATES["data"]), "error": None}
+
+        if _STATES["loading"]:
+            return {"status": "loading", "states": [], "error": None}
+
+        return {"status": "error", "states": [], "error": _STATES["error"]}
+
+
+def _sample_resource(resource_id, state, max_pages, max_seconds):
+    """Spread-out sample of one state's rows (random pages across the whole table)."""
+
+    deadline = time.monotonic() + max_seconds
+
+    for title_case in (True, False):
+
+        try:
+            first = _request_page(
+                resource_id, state, None, None,
+                limit=PAGE_SIZE, offset=0, title_case_filters=title_case
+            )
+        except AGMARKNETFilterError:
+            continue
+
+        rows = list(first.get("records", []))
+
+        if not rows or not _row_matches(rows[0], state, None, None):
+            continue
+
+        total = _to_int(first.get("total"))
+        step = len(rows)
+
+        offsets = list(range(step, total, step))
+        random.Random(11).shuffle(offsets)
+
+        rows += _fetch_offsets(
+            resource_id, state, None, None, title_case,
+            offsets[:max(max_pages - 1, 0)], step, deadline
+        )
+
+        return rows
+
+    return []
+
+
+def _districts_worker(state, key, today):
+
+    names, errors = set(), []
+
+    for resource_id, fetch in (
+        (CURRENT_RESOURCE_ID, lambda r: _fetch_resource(r, state, None, None, max_seconds=15)),
+        (HISTORICAL_RESOURCE_ID, lambda r: _sample_resource(r, state, DISTRICT_SAMPLE_PAGES, DISTRICT_SECONDS)),
+    ):
+
+        try:
+
+            for record in fetch(resource_id):
+                district = str(record.get("District", "")).strip()
+                if district:
+                    names.add(district)
+
+        except AGMARKNETError as exc:
+            errors.append(exc)
+
+    with _LOCATIONS_LOCK:
+
+        if names:
+            _DISTRICTS[key].update(day=today, data=sorted(names), error=None)
+            print(f"AGMARKNET districts for {state}: {len(names)}")
+        else:
+            _DISTRICTS[key].update(error=str(errors[0]) if errors else "No districts found.", failed_at=time.monotonic())
+
+        _DISTRICTS[key]["loading"] = False
+
+
+def get_districts_status(state):
+    """{'status': 'ready' | 'loading' | 'error', 'districts': [...], 'error': str} for one state."""
+
+    key = state.strip().lower()
+    today = _today()
+
+    with _LOCATIONS_LOCK:
+
+        entry = _DISTRICTS.setdefault(key, {"day": None, "data": None, "loading": False, "error": None, "failed_at": 0.0})
+
+        fresh = entry["data"] is not None and entry["day"] == today
+        retry_later = entry["error"] and time.monotonic() - entry["failed_at"] < 30
+
+        if not fresh and not entry["loading"] and not retry_later:
+            entry["loading"] = True
+            threading.Thread(target=_districts_worker, args=(state.strip(), key, today), daemon=True).start()
+
+        if entry["data"] is not None and (fresh or entry["loading"]):
+            return {"status": "ready", "districts": list(entry["data"]), "error": None}
+
+        if entry["loading"]:
+            return {"status": "loading", "districts": [], "error": None}
+
+        if entry["data"] is not None:
+            return {"status": "ready", "districts": list(entry["data"]), "error": None}
+
+        return {"status": "error", "districts": [], "error": entry["error"]}
+
+
+# ============================================================
+# ALL MARKETS OF A DISTRICT (used by the map)
+# ============================================================
+
+def get_district_markets(
+    state: str,
+    district: str
+):
+    """Mandis currently reporting in this district (live dataset, one small request).
+    Deliberately NOT the 5-year history, which would take minutes just to list market names."""
+
+    api_state, api_district = resolve_names(state, district)
+
+    try:
+
+        records = _fetch_resource(
+            CURRENT_RESOURCE_ID, api_state, api_district, None
+        )
+
+    except AGMARKNETError:
+
+        return []
+
+    return sorted(
+        {str(r.get("Market", "")).strip() for r in records if r.get("Market")}
+    )
 
 
 # ============================================================
@@ -590,28 +1002,15 @@ def get_latest_record(
 
     return {
 
-        "date":
-            row["arrival_date"].strftime(
-                "%Y-%m-%d"
-            ),
+        "date": row["arrival_date"].strftime("%Y-%m-%d"),
 
-        "market":
-            row["market"],
+        "market": row["market"],
 
-        "min_price":
-            float(
-                row["min_price"]
-            ),
+        "min_price": float(row["min_price"]),
 
-        "modal_price":
-            float(
-                row["modal_price"]
-            ),
+        "modal_price": float(row["modal_price"]),
 
-        "max_price":
-            float(
-                row["max_price"]
-            )
+        "max_price": float(row["max_price"])
     }
 
 
@@ -620,45 +1019,63 @@ def get_latest_record(
 # ============================================================
 
 def get_monthly_history(
-    df
+    df,
+    start_year: int = HISTORY_START_YEAR
 ):
+    """Monthly modal price from `start_year` (default 2015) up to the latest data.
+
+    Robust version: each month is the MEDIAN of the reported modal prices (a few expensive
+    varieties or typo prices cannot drag it), months with very few observations are
+    treated as missing and interpolated, and isolated spikes far from their neighbours
+    are pulled back to the local level. The last month stays the real latest median.
+    """
+
+    columns = ["date", "modal_price"]
 
     if df.empty:
+        return pd.DataFrame(columns=columns)
 
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "modal_price"
-            ]
-        )
+    temp = df.dropna(subset=["arrival_date", "modal_price"])
+    temp = temp[temp["modal_price"] > 0]
 
-    temp = df.copy()
+    if temp.empty:
+        return pd.DataFrame(columns=columns)
 
-    temp = temp.dropna(
-        subset=[
-            "arrival_date",
-            "modal_price"
-        ]
-    )
+    since = temp[temp["arrival_date"] >= pd.Timestamp(year=start_year, month=1, day=1)]
+
+    if not since.empty:         # if the API has nothing that recent, use whatever it has
+        temp = since
+
+    # Drop absurd rows (typos / other units) relative to the overall typical price.
+    typical = float(temp["modal_price"].median())
+    temp = temp[(temp["modal_price"] >= typical / 8) & (temp["modal_price"] <= typical * 8)]
+
+    temp = temp.assign(month=temp["arrival_date"].dt.to_period("M").dt.to_timestamp())
+
+    grouped = temp.groupby("month")["modal_price"]
+    median = grouped.median()
+    count = grouped.size()
+
+    full_index = pd.date_range(median.index.min(), median.index.max(), freq="MS")
+    series = median.reindex(full_index)
+    counts = count.reindex(full_index).fillna(0)
+
+    # Months with too few observations are unreliable (keep the latest month anyway).
+    weak = counts < 3
+    weak.iloc[-1] = False
+    series[weak] = float("nan")
+
+    # Pull isolated spikes back towards the local level.
+    local = series.rolling(7, center=True, min_periods=3).median()
+    spike = (series > local * 2.0) | (series < local * 0.5)
+    series[spike.fillna(False)] = local[spike.fillna(False)]
+
+    series = series.interpolate(limit_direction="both")
 
     monthly = (
-        temp
-        .set_index(
-            "arrival_date"
-        )
-        ["modal_price"]
-        .resample("MS")
-        .mean()
+        pd.DataFrame({"date": series.index, "modal_price": series.values})
         .dropna()
-        .reset_index()
-    )
-
-    monthly.rename(
-        columns={
-            "arrival_date":
-                "date"
-        },
-        inplace=True
+        .reset_index(drop=True)
     )
 
     return monthly
