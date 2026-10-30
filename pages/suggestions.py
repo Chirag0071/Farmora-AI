@@ -139,31 +139,16 @@ def app():
             0,
         )
 
-        st.markdown(
-            f"""
-            <div class="glass-card">
-                <h3>
-                    {index}. 🌱 {crop_name}
-                </h3>
-
-                <p>
-                    Average market price:
-                    <b>₹{average_price:,.0f}</b>
-                </p>
-
-                <p>
-                    Markets:
-                    <b>{market_count}</b>
-                </p>
-
-                <p>
-                    Market observations:
-                    <b>{observations}</b>
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        card = (
+            '<div class="glass-card">'
+            f"<h3>{index}. 🌱 {crop_name}</h3>"
+            f"<p>Average market price: <b>₹{average_price:,.0f}</b></p>"
+            f"<p>Markets: <b>{market_count}</b></p>"
+            f"<p>Market observations: <b>{observations}</b></p>"
+            "</div>"
         )
+
+        st.markdown(card, unsafe_allow_html=True)
 
 
 # --------------------------------------------------
