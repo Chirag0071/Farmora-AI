@@ -1,4 +1,6 @@
+from contextlib import asynccontextmanager
 from typing import Optional
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 from backend.services.agmarknet import (
@@ -7,6 +9,9 @@ from backend.services.agmarknet import (
     get_price_by_date,
     get_latest_record,
     get_monthly_history,
+    ensure_location_index,
+    get_states_status,
+    get_districts_status,
 )
 
 from backend.services.forecasting import (
@@ -14,7 +19,8 @@ from backend.services.forecasting import (
 )
 
 from backend.services.geocoding import (
-    get_market_locations
+    get_market_locations,
+    warm_market_locations
 )
 
 from backend.services.recommendations import (
@@ -22,9 +28,19 @@ from backend.services.recommendations import (
 )
 
 
+@asynccontextmanager
+async def lifespan(_app):
+
+    # Start building the AGMARKNET state/district list as soon as the backend starts.
+    ensure_location_index()
+
+    yield
+
+
 app = FastAPI(
     title="Farmora API",
-    version="1.0"
+    version="1.0",
+    lifespan=lifespan
 )
 
 
@@ -122,6 +138,35 @@ def health():
 
 
 # ============================================================
+# STATES / DISTRICTS (AGMARKNET spelling, used by the Predict page)
+# ============================================================
+
+@app.get("/locations/states")
+def location_states():
+
+    status = get_states_status()
+
+    return {
+        "status": status["status"],
+        "message": status["error"],
+        "states": status["states"]
+    }
+
+
+@app.get("/locations/districts")
+def location_districts(state: str):
+
+    status = get_districts_status(state)
+
+    return {
+        "status": status["status"],
+        "message": status["error"],
+        "state": state,
+        "districts": status["districts"]
+    }
+
+
+# ============================================================
 # PRICE HISTORY
 # ============================================================
 
@@ -209,21 +254,49 @@ def price_history(
         )
 
         # ----------------------------------------------------
-        # Monthly history
+        # Monthly history + forecast
+        # If the user typed an arrival date, analyse all data from 2015 up to that
+        # date and predict the 12 months after it. Otherwise use the latest data.
         # ----------------------------------------------------
+
+        analysis_df = df
+
+        if request.arrival_date:
+
+            anchor = pd.to_datetime(
+                request.arrival_date,
+                dayfirst=True,
+                errors="coerce"
+            )
+
+            if pd.notna(anchor):
+
+                upto = df[
+                    df["arrival_date"]
+                    < anchor.normalize() + pd.Timedelta(days=1)
+                ]
+
+                if not upto.empty:
+                    analysis_df = upto
 
         monthly = get_monthly_history(
-            df
+            analysis_df
         )
-
-        # ----------------------------------------------------
-        # Forecast
-        # ----------------------------------------------------
 
         forecast = forecast_prices(
             monthly_history=monthly,
             periods=request.forecast_months
         )
+
+        # Start locating the district's markets now, so the map is ready soon.
+        try:
+            warm_market_locations(
+                request.state,
+                request.district,
+                df["market"].unique()
+            )
+        except Exception as exc:
+            print("Map warm-up skipped:", repr(exc))
 
         # ----------------------------------------------------
         # Raw records
@@ -231,7 +304,9 @@ def price_history(
 
         records = []
 
-        for _, row in df.iterrows():
+        # The result page does not use the raw rows; with 2015-today data there can be
+        # 100k+ of them, so only the newest 500 are sent.
+        for _, row in df.tail(500).iterrows():
 
             records.append({
 
@@ -343,7 +418,7 @@ def price_history(
                 latest,
 
             "record_count":
-                len(records),
+                len(df),
 
             "records":
                 records,
@@ -353,6 +428,17 @@ def price_history(
 
             "forecast":
                 forecast_records,
+
+            "analysis": {
+                "history_from":
+                    monthly["date"].min().strftime("%Y-%m-%d")
+                    if not monthly.empty else None,
+                "history_to":
+                    monthly["date"].max().strftime("%Y-%m-%d")
+                    if not monthly.empty else None,
+                "months_used":
+                    len(monthly)
+            },
 
             "selected_date":
                 request.arrival_date,
